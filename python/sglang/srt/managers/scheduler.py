@@ -875,6 +875,12 @@ class Scheduler(
                 from sglang.srt.mem_cache.chunk_cache import SWAChunkCache
 
                 self.tree_cache = SWAChunkCache(params)
+        elif server_args.enable_template_chunk_cache:
+            from sglang.srt.mem_cache.template_chunk_cache import (
+                TemplateAwareChunkCache,
+            )
+
+            self.tree_cache = TemplateAwareChunkCache(params)
         else:
             if envs.SGLANG_EXPERIMENTAL_CPP_RADIX_TREE.get():
                 # lazy import to avoid JIT overhead
@@ -2021,6 +2027,9 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                template_id=recv_req.template_id,
+                segment_boundaries=recv_req.segment_boundaries,
+                segment_kinds=recv_req.segment_kinds,
             )
             req.tokenizer = self.tokenizer
 

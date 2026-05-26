@@ -260,6 +260,15 @@ class GenerateReqInput(BaseReq):
     # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
     multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
+    # Template-aware chunk cache: client may send a registered template id plus
+    # variable substitutions instead of (or in addition to) raw text / input_ids.
+    # When set, TokenizerManager expands the template into input_ids and emits
+    # per-segment boundaries so the cache can carve KV by template segment.
+    template_id: Optional[Union[List[Optional[str]], str]] = None
+    template_vars: Optional[Union[List[Optional[Dict[str, str]]], Dict[str, str]]] = (
+        None
+    )
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -305,6 +314,14 @@ class GenerateReqInput(BaseReq):
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
+        # Template-aware path: a registered template_id substitutes for the raw
+        # input fields. TokenizerManager will expand it into input_ids.
+        if self.template_id is not None and (
+            self.text is None
+            and self.input_ids is None
+            and self.input_embeds is None
+        ):
+            return
         if (
             self.text is None and self.input_ids is None and self.input_embeds is None
         ) or (
@@ -318,6 +335,20 @@ class GenerateReqInput(BaseReq):
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
+        # Template-only path: batch shape is derived from template_id.
+        if (
+            self.template_id is not None
+            and self.text is None
+            and self.input_ids is None
+            and self.input_embeds is None
+        ):
+            if isinstance(self.template_id, list):
+                self.is_single = False
+                self.batch_size = len(self.template_id)
+            else:
+                self.is_single = True
+                self.batch_size = 1
+            return
         if self.text is not None:
             if isinstance(self.text, str):
                 self.is_single = True
@@ -702,6 +733,16 @@ class GenerateReqInput(BaseReq):
                 if self.multi_item_delimiter_indices is not None
                 else None
             ),
+            template_id=(
+                self.template_id[i]
+                if isinstance(self.template_id, list)
+                else self.template_id
+            ),
+            template_vars=(
+                self.template_vars[i]
+                if isinstance(self.template_vars, list)
+                else self.template_vars
+            ),
         )
         cache[i] = sub
         return sub
@@ -795,6 +836,13 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Pre-computed delimiter indices for multi-item scoring
     multi_item_delimiter_indices: Optional[List[int]] = None
+
+    # Template-aware chunk cache metadata. When `template_id` is set,
+    # `segment_boundaries` has length `len(segment_kinds) + 1` and
+    # `input_ids[segment_boundaries[i]:segment_boundaries[i+1]]` is segment i.
+    template_id: Optional[str] = None
+    segment_boundaries: Optional[List[int]] = None
+    segment_kinds: Optional[List[str]] = None
 
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
@@ -1292,6 +1340,27 @@ class ListExternalCorporaReqInput(BaseReq):
 class ListExternalCorporaReqOutput(BaseReq):
     success: bool
     corpus_token_counts: Dict[str, int] = field(default_factory=dict)
+    message: str = ""
+
+
+@dataclass
+class RegisterPromptTemplateReqInput(BaseReq):
+    """Register a prompt template for use with TemplateAwareChunkCache.
+
+    Each segment dict has:
+      - kind: "fixed" or "var"
+      - text: required for "fixed"
+      - var_name: required for "var"
+    """
+
+    template_id: str = ""
+    segments: List[Dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class RegisterPromptTemplateReqOutput(BaseReq):
+    success: bool
+    template_id: str = ""
     message: str = ""
 
 

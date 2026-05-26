@@ -685,6 +685,11 @@ class ServerArgs:
     # placeholder token. See MIS_DELIMITER_TOKEN_ID for details.
     enable_mis: bool = False
 
+    # Template-aware chunk prefix cache: when set, the scheduler uses
+    # TemplateAwareChunkCache instead of RadixCache. Requires clients to
+    # register prompt templates via /register_prompt_template.
+    enable_template_chunk_cache: bool = False
+
     # Optimization/debug options
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
@@ -4158,6 +4163,20 @@ class ServerArgs:
                 "and cannot be used at the same time. Please use only one of them."
             )
 
+        if self.enable_template_chunk_cache:
+            conflicts = []
+            if self.enable_hierarchical_cache:
+                conflicts.append("--enable-hierarchical-cache")
+            if self.enable_lmcache:
+                conflicts.append("--enable-lmcache")
+            if self.disable_radix_cache:
+                conflicts.append("--disable-radix-cache")
+            if conflicts:
+                raise ValueError(
+                    "--enable-template-chunk-cache is mutually exclusive with: "
+                    + ", ".join(conflicts)
+                )
+
         if self.disaggregation_decode_enable_offload_kvcache:
             if self.disaggregation_mode != "decode":
                 raise ValueError(
@@ -6267,6 +6286,15 @@ class ServerArgs:
         )
 
         # Optimization/debug options
+        parser.add_argument(
+            "--enable-template-chunk-cache",
+            action="store_true",
+            default=ServerArgs.enable_template_chunk_cache,
+            help="Use TemplateAwareChunkCache as the prefix cache. Each chunk "
+            "corresponds to a registered prompt template segment (fixed/var). "
+            "Clients must register templates via /register_prompt_template "
+            "before sending requests with `template_id`.",
+        )
         parser.add_argument(
             "--disable-radix-cache",
             action="store_true",

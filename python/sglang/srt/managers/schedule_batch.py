@@ -620,6 +620,9 @@ class Req(ReqDllmMixin):
         ] = None,
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
+        template_id: Optional[str] = None,
+        segment_boundaries: Optional[List[int]] = None,
+        segment_kinds: Optional[List[str]] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -751,6 +754,12 @@ class Req(ReqDllmMixin):
         self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
+
+        # Template-aware chunk cache metadata. Set by TokenizerManager when the
+        # request was expanded from a registered template; None otherwise.
+        self.template_id: Optional[str] = template_id
+        self.segment_boundaries: Optional[List[int]] = segment_boundaries
+        self.segment_kinds: Optional[List[str]] = segment_kinds
 
         # Whether or not if it is chunked. It increments whenever
         # it is chunked, and decrement whenever chunked request is

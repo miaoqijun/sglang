@@ -65,12 +65,19 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     OpenSessionReqOutput,
     PauseGenerationReqInput,
+    RegisterPromptTemplateReqInput,
+    RegisterPromptTemplateReqOutput,
     SessionParams,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     WatchLoadUpdateReq,
+)
+from sglang.srt.managers.prompt_template_registry import (
+    PromptTemplate,
+    PromptTemplateRegistry,
+    expand_template,
 )
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
@@ -367,6 +374,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.event_loop = None
         self.asyncio_tasks = set()
 
+        # Prompt templates registered for the template-aware chunk cache.
+        self.prompt_template_registry: PromptTemplateRegistry = PromptTemplateRegistry()
+
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
@@ -512,6 +522,44 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
+
+    async def register_prompt_template(
+        self, obj: RegisterPromptTemplateReqInput
+    ) -> RegisterPromptTemplateReqOutput:
+        """Register a prompt template; pre-tokenize fixed segments locally.
+
+        The registry lives only on the TokenizerManager: scheduler-side
+        TemplateAwareChunkCache only needs the per-segment token IDs that the
+        TokenizerManager already places on TokenizedGenerateReqInput.
+        """
+        self.auto_create_handle_loop()
+        if self.tokenizer is None:
+            return RegisterPromptTemplateReqOutput(
+                success=False,
+                message=(
+                    "Prompt templates require a tokenizer; the engine was "
+                    "initialized with skip_tokenizer_init=True."
+                ),
+            )
+        try:
+            template = PromptTemplate.from_dict(
+                {"template_id": obj.template_id, "segments": obj.segments}
+            )
+            self.prompt_template_registry.register(template, self.tokenizer)
+            return RegisterPromptTemplateReqOutput(
+                success=True,
+                template_id=template.template_id,
+                message=(
+                    f"Registered template {template.template_id!r} with "
+                    f"{len(template.segments)} segments."
+                ),
+            )
+        except Exception as e:
+            return RegisterPromptTemplateReqOutput(
+                success=False,
+                template_id=obj.template_id,
+                message=str(e),
+            )
 
     async def generate_request(
         self,
@@ -710,6 +758,36 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         is_cross_encoder_request = (
             isinstance(obj, EmbeddingReqInput) and obj.is_cross_encoder_request
         )
+
+        # Template-aware path: expand the registered template into input_ids
+        # and stash the per-segment boundaries on the request so the
+        # TemplateAwareChunkCache can carve KV by template segment.
+        template_id = getattr(obj, "template_id", None)
+        if template_id is not None:
+            if self.tokenizer is None:
+                raise ValueError(
+                    "Prompt templates require a tokenizer; the engine was "
+                    "initialized with skip_tokenizer_init=True."
+                )
+            template = self.prompt_template_registry.get(template_id)
+            if template is None:
+                raise ValueError(
+                    f"Unknown template_id {template_id!r}. Register the template "
+                    "via POST /register_prompt_template before submitting."
+                )
+            template_vars = getattr(obj, "template_vars", None) or {}
+            expanded_ids, segment_boundaries, segment_kinds = expand_template(
+                template, template_vars, self.tokenizer
+            )
+            # Stash for _create_tokenized_object to thread through.
+            obj._expanded_segment_boundaries = segment_boundaries
+            obj._expanded_segment_kinds = segment_kinds
+            input_ids = expanded_ids
+            self._validate_one_request(obj, input_ids)
+            return self._create_tokenized_object(
+                obj, input_text, input_ids, None, None, None
+            )
+
         if obj.input_embeds is not None:
             if not self.server_args.disable_radix_cache:
                 raise ValueError(
@@ -1029,6 +1107,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                 num_items_assigned=obj.num_items_assigned,
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
+                template_id=getattr(obj, "template_id", None),
+                segment_boundaries=getattr(
+                    obj, "_expanded_segment_boundaries", None
+                ),
+                segment_kinds=getattr(obj, "_expanded_segment_kinds", None),
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available

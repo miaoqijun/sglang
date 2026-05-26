@@ -776,6 +776,41 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     )
 
 
+@app.post("/register_prompt_template")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def register_prompt_template(request: Request):
+    """Register a prompt template for use with TemplateAwareChunkCache.
+
+    Body schema:
+      {
+        "template_id": "<unique id>",
+        "segments": [
+          {"kind": "fixed", "text": "..."},
+          {"kind": "var",   "var_name": "..."},
+          ...
+        ]
+      }
+    """
+    from sglang.srt.managers.io_struct import RegisterPromptTemplateReqInput
+
+    try:
+        obj = RegisterPromptTemplateReqInput(**(await request.json()))
+    except TypeError as e:
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+    result = await _global_state.tokenizer_manager.register_prompt_template(obj)
+    return ORJSONResponse(
+        {
+            "success": result.success,
+            "template_id": result.template_id,
+            "message": result.message,
+        },
+        status_code=200 if result.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.post("/add_external_corpus")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def add_external_corpus(request: Request):
