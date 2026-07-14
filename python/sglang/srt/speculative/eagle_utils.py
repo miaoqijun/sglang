@@ -354,11 +354,32 @@ def eagle_prepare_for_verify(
     return verify_forward_batch, can_run_cuda_graph
 
 
+def apply_target_predict_override(
+    target_predict: torch.Tensor,
+    target_predict_override: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if target_predict_override is None:
+        return target_predict
+    if target_predict_override.shape != target_predict.shape:
+        raise ValueError(
+            "target_predict_override shape does not match speculative logits"
+        )
+    target_predict_override = target_predict_override.to(
+        device=target_predict.device, dtype=target_predict.dtype
+    )
+    return torch.where(
+        target_predict_override >= 0,
+        target_predict_override,
+        target_predict,
+    )
+
+
 def eagle_sample(
     verify_input: EagleVerifyInput,
     batch: ScheduleBatch,
     logits_output: LogitsProcessorOutput,
     vocab_mask: torch.Tensor = None,
+    target_predict_override: Optional[torch.Tensor] = None,
 ):
     """
     Verify and find accepted tokens based on logits output and batch
@@ -433,10 +454,18 @@ def eagle_sample(
     )
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
+    if target_predict_override is not None and not (
+        sampling_info.is_all_greedy or _is_npu or _is_hip
+    ):
+        raise ValueError("Teacher-forced speculative verify requires greedy sampling")
+
     # Sample tokens
     if sampling_info.is_all_greedy or _is_npu or _is_hip:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
+        target_predict = apply_target_predict_override(
+            target_predict, target_predict_override
+        )
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable
             accept_index=accept_index,  # mutable

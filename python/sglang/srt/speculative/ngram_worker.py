@@ -32,6 +32,92 @@ logger = logging.getLogger(__name__)
 
 
 USE_FULL_MASK = True
+NGRAM_TEACHER_FORCING_TOKEN_IDS = "ngram_teacher_forcing_token_ids"
+
+
+def build_ngram_teacher_forcing_targets(
+    reqs,
+    positions: torch.Tensor,
+    vocab_size: int,
+    output_offsets: Optional[list[int]] = None,
+    position_shift: int = 0,
+) -> Optional[torch.Tensor]:
+    """Map absolute model positions to per-request oracle output tokens."""
+    if positions.shape[0] != len(reqs):
+        raise ValueError("Teacher-forcing positions must have one row per request")
+
+    token_rows: list[Optional[list[int]]] = []
+    max_len = 0
+    for req in reqs:
+        custom_params = req.sampling_params.custom_params
+        raw_tokens = (
+            custom_params.get(NGRAM_TEACHER_FORCING_TOKEN_IDS)
+            if isinstance(custom_params, dict)
+            else None
+        )
+        if raw_tokens is None:
+            token_rows.append(None)
+            continue
+        if not isinstance(raw_tokens, list) or not raw_tokens:
+            raise ValueError(
+                f"{NGRAM_TEACHER_FORCING_TOKEN_IDS} must be a non-empty list"
+            )
+        if any(
+            isinstance(token, bool) or not isinstance(token, int)
+            for token in raw_tokens
+        ):
+            raise ValueError(
+                f"{NGRAM_TEACHER_FORCING_TOKEN_IDS} must contain integer token ids"
+            )
+        tokens = raw_tokens
+        if any(token < 0 or token >= vocab_size for token in tokens):
+            raise ValueError(
+                f"{NGRAM_TEACHER_FORCING_TOKEN_IDS} contains an invalid token id"
+            )
+        token_rows.append(tokens)
+        max_len = max(max_len, len(tokens))
+
+    if max_len == 0:
+        return None
+
+    original_shape = positions.shape
+    positions = positions.reshape(len(reqs), -1).to(torch.int64)
+    oracle_tokens = torch.full(
+        (len(reqs), max_len),
+        -1,
+        dtype=torch.int64,
+        device=positions.device,
+    )
+    oracle_lens = torch.zeros(
+        len(reqs), dtype=torch.int64, device=positions.device
+    )
+    for index, tokens in enumerate(token_rows):
+        if tokens is None:
+            continue
+        oracle_tokens[index, : len(tokens)] = torch.tensor(
+            tokens, dtype=torch.int64, device=positions.device
+        )
+        oracle_lens[index] = len(tokens)
+
+    if output_offsets is None:
+        origin_lens = torch.tensor(
+            [len(req.origin_input_ids) for req in reqs],
+            dtype=torch.int64,
+            device=positions.device,
+        )
+        oracle_indices = positions - origin_lens[:, None] + position_shift
+    else:
+        if len(output_offsets) != len(reqs):
+            raise ValueError("Teacher-forcing output offsets must match requests")
+        offsets = torch.tensor(
+            output_offsets, dtype=torch.int64, device=positions.device
+        )
+        tree_depths = positions - positions[:, :1]
+        oracle_indices = offsets[:, None] + tree_depths
+    valid = (oracle_indices >= 0) & (oracle_indices < oracle_lens[:, None])
+    targets = oracle_tokens.gather(1, oracle_indices.clamp(0, max_len - 1))
+    targets.masked_fill_(~valid, -1)
+    return targets.reshape(original_shape)
 
 
 class NGRAMWorker(BaseSpecWorker):
@@ -433,7 +519,18 @@ class NGRAMWorker(BaseSpecWorker):
                 predict,
                 accept_lens,
                 accept_index,
-            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+            ) = eagle_sample(
+                verify_input,
+                batch,
+                logits_output,
+                vocab_mask,
+                target_predict_override=build_ngram_teacher_forcing_targets(
+                    batch.reqs,
+                    verify_input.positions.reshape(bs, self.draft_token_num),
+                    batch.sampling_info.vocab_size,
+                    position_shift=1,
+                ),
+            )
             new_seq_lens = batch.seq_lens + accept_lens
             commit_mamba_states_after_verify(
                 self.target_worker,
@@ -488,6 +585,16 @@ class NGRAMWorker(BaseSpecWorker):
                 batch_result.next_token_ids,
                 batch_result.can_run_cuda_graph,
             )
+            teacher_forced = build_ngram_teacher_forcing_targets(
+                batch.reqs,
+                batch.seq_lens.reshape(bs),
+                batch.sampling_info.vocab_size,
+            )
+            if teacher_forced is not None:
+                teacher_forced = teacher_forced.to(
+                    device=predict.device, dtype=predict.dtype
+                )
+                predict = torch.where(teacher_forced >= 0, teacher_forced, predict)
             new_seq_lens = batch.seq_lens.clone()
 
             accept_tokens = torch.zeros(
