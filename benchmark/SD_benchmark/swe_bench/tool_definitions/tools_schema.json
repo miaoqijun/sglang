@@ -1,0 +1,88 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "execute_bash",
+      "description": "Execute a bash command in the terminal within a persistent shell session.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The bash command to execute. Can be empty to view additional logs when previous exit code is -1. Can be C-c to interrupt the currently running process."
+          },
+          "is_input": {
+            "type": "string",
+            "enum": ["true", "false"],
+            "description": "If true, the command is input to a running process. If false, it is a bash command. Default is false."
+          },
+          "timeout": {
+            "type": "number",
+            "description": "Optional hard timeout in seconds."
+          }
+        },
+        "required": ["command"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "str_replace_editor",
+      "description": "Custom editing tool for viewing, creating and editing files in plain-text format.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "enum": ["view", "create", "str_replace", "insert", "undo_edit"],
+            "description": "The command to run."
+          },
+          "path": {
+            "type": "string",
+            "description": "Absolute path to file or directory, e.g. /workspace/file.py or /workspace."
+          },
+          "file_text": {
+            "type": "string",
+            "description": "Required for create; content of the file to create."
+          },
+          "old_str": {
+            "type": "string",
+            "description": "Required for str_replace; exact string in path to replace."
+          },
+          "new_str": {
+            "type": "string",
+            "description": "Replacement string for str_replace, or inserted string for insert."
+          },
+          "insert_line": {
+            "type": "integer",
+            "description": "Required for insert; new_str is inserted after this 1-indexed line."
+          },
+          "view_range": {
+            "type": "array",
+            "items": {"type": "integer"},
+            "description": "Optional line range for view when path is a file. [start, -1] means to EOF."
+          }
+        },
+        "required": ["command", "path"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "think",
+      "description": "Log a thought without obtaining new information or changing repository state.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "thought": {
+            "type": "string",
+            "description": "The thought to log."
+          }
+        },
+        "required": ["thought"]
+      }
+    }
+  }
+]

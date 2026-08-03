@@ -321,6 +321,19 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in records)
     completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in records)
     errors = sum(1 for row in records if row.get("error"))
+    def percentile(values: list[float], q: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return round(ordered[0], 6)
+        pos = (len(ordered) - 1) * q
+        lower = int(pos)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = pos - lower
+        value = ordered[lower] * (1 - weight) + ordered[upper] * weight
+        return round(value, 6)
+
     return {
         "turns": len(records),
         "errors": errors,
@@ -331,6 +344,9 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         if latencies
         else None,
         "latency_max_s": round(max(latencies), 6) if latencies else None,
+        "latency_p50_s": percentile(latencies, 0.50),
+        "latency_p90_s": percentile(latencies, 0.90),
+        "latency_p99_s": percentile(latencies, 0.99),
     }
 
 
@@ -532,6 +548,9 @@ def main() -> int:
         "concurrency": args.concurrency,
         "items": len(items),
         "wall_time_s": round(wall_time_s, 6),
+        "requests_s": round(len(all_records) / wall_time_s, 6)
+        if wall_time_s > 0
+        else None,
         "trace_output": str(trace_path),
         **summarize(all_records),
     }
