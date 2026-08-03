@@ -38,8 +38,17 @@ BENCHMARKS_STR="${BENCHMARKS:-${BENCHMARK}}"
 BENCHMARKS_STR="${BENCHMARKS_STR//,/ }"
 read -r -a BENCHMARKS_ARR <<< "${BENCHMARKS_STR}"
 BENCHMARK_ROOT="${BENCHMARK_ROOT:-${AS_DIR}/SD_benchmark}"
+SWE_TRACE_JSONL="${SWE_TRACE_JSONL:-${AS_DIR}/SD_benchmark/outputs/swe_bench/openhands_llm_calls.jsonl}"
+SWE_TOOL_MODE="${SWE_TOOL_MODE:-api}"
+SWE_TOOL_SCHEMA="${SWE_TOOL_SCHEMA:-${AS_DIR}/SD_benchmark/swe_bench/tool_definitions/tools_schema.json}"
+SWE_TOOL_CHOICE="${SWE_TOOL_CHOICE:-required}"
+SWE_TOOL_CALL_PARSER="${SWE_TOOL_CALL_PARSER:-qwen}"
+SWE_TOOL_PROMPT="${SWE_TOOL_PROMPT:-${AS_DIR}/SD_benchmark/swe_bench/tool_definitions/openhands_tools_plain_prompt.md}"
+SWE_FAILURE_LIST_OUTPUT="${SWE_FAILURE_LIST_OUTPUT:-}"
+SWE_SKIP_FAILURE_LIST="${SWE_SKIP_FAILURE_LIST:-}"
 CATEGORIES="${CATEGORIES:-}"
 LIMIT="${LIMIT:-}"
+MAX_STEPS_PER_WORKFLOW="${MAX_STEPS_PER_WORKFLOW:-}"
 HUMANEVAL_STYLE="${HUMANEVAL_STYLE:-completion_instruction}"
 
 # Deterministic-ish defaults for workload comparison.
@@ -67,17 +76,18 @@ NGRAM_BACKMATCH_MAX_CANDIDATES="${NGRAM_BACKMATCH_MAX_CANDIDATES:-16}"
 NGRAM_HYBRID_SCAN_OCCURRENCES="${NGRAM_HYBRID_SCAN_OCCURRENCES:-0}"
 NGRAM_PROB_BACKMATCH_MAX_CONTEXTS_PER_NODE="${NGRAM_PROB_BACKMATCH_MAX_CONTEXTS_PER_NODE:-64}"
 NGRAM_SCOPE_BY_EXTRA_KEY="${NGRAM_SCOPE_BY_EXTRA_KEY:-0}"
+NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-8}"
 
 CONCURRENCIES_STR="${CONCURRENCIES:-1 4 16 32 64 100}"
 read -r -a CONCURRENCIES_ARR <<< "${CONCURRENCIES_STR}"
 
 # Supported variants:
 #   baseline
-#   ngram_d4 ngram_d8
-#   ngram_bfs_d4 ngram_bfs_d8
-#   ngram_prob_d4 ngram_prob_d8
-#   ngram_backmatch_d8
-#   ngram_prob_backmatch_d8 prob_backmatch
+#   ngram_d<N> / ngram_bfs_d<N>
+#   ngram_prob_d<N> / prob_d<N>
+#   ngram_backmatch_d<N> / backmatch_d<N>
+#   ngram_prob_backmatch_d<N> / prob_backmatch_d<N> / prob_backmatch
+# For variants without an explicit d<N>, NGRAM_DRAFT_TOKENS is used.
 VARIANTS_STR="${VARIANTS:-baseline ngram_d8}"
 read -r -a VARIANTS_ARR <<< "${VARIANTS_STR}"
 
@@ -105,7 +115,7 @@ validate_benchmarks() {
   fi
   for benchmark in "${BENCHMARKS_ARR[@]}"; do
     case "${benchmark}" in
-      HumanEval|human_eval|humaneval|mt_bench|mtbench|spec_bench|specbench)
+      HumanEval|human_eval|humaneval|mt_bench|mtbench|spec_bench|specbench|swe_bench|swebench)
         ;;
       *)
         echo "ERROR: unsupported benchmark=${benchmark}" >&2
@@ -270,34 +280,38 @@ wait_for_server() {
 
 variant_spec_args() {
   local variant="$1"
-  local draft=""
+  local draft="${NGRAM_DRAFT_TOKENS}"
   local match_type="BFS"
   case "${variant}" in
     baseline)
       return 0
       ;;
-    ngram_d4|ngram_bfs_d4|ngram_cold_d4)
-      draft=4
+    ngram|ngram_bfs|ngram_cold)
       match_type="BFS"
       ;;
-    ngram_d8|ngram_bfs_d8|ngram_cold_d8)
-      draft=8
+    ngram_d*|ngram_bfs_d*|ngram_cold_d*)
+      draft="${variant##*_d}"
       match_type="BFS"
       ;;
-    ngram_prob_d4|prob_d4)
-      draft=4
+    ngram_prob|prob)
       match_type="PROB"
       ;;
-    ngram_prob_d8|prob_d8)
-      draft=8
+    ngram_prob_d*|prob_d*)
+      draft="${variant##*_d}"
       match_type="PROB"
       ;;
-    ngram_backmatch_d8|backmatch_d8)
-      draft=8
+    ngram_backmatch|backmatch)
       match_type="BACKMATCH"
       ;;
-    ngram_prob_backmatch_d8|prob_backmatch_d8|prob_backmatch)
-      draft=8
+    ngram_backmatch_d*|backmatch_d*)
+      draft="${variant##*_d}"
+      match_type="BACKMATCH"
+      ;;
+    ngram_prob_backmatch|prob_backmatch)
+      match_type="PROB_BACKMATCH"
+      ;;
+    ngram_prob_backmatch_d*|prob_backmatch_d*)
+      draft="${variant##*_d}"
       match_type="PROB_BACKMATCH"
       ;;
     *)
@@ -305,6 +319,10 @@ variant_spec_args() {
       exit 2
       ;;
   esac
+  if ! [[ "${draft}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: could not parse draft length for VARIANT=${variant}; got draft=${draft}" >&2
+    exit 2
+  fi
 
   echo \
     "--speculative-algorithm NGRAM" \
@@ -354,6 +372,12 @@ start_server() {
   if [[ "${NGRAM_SCOPE_BY_EXTRA_KEY}" == "1" ]]; then
     scope_args+=(--speculative-ngram-scope-by-extra-key)
   fi
+  local tool_call_parser_args=()
+  if [[ "${CURRENT_BENCHMARK}" == "swe_bench" || "${CURRENT_BENCHMARK}" == "swebench" ]]; then
+    if [[ "${SWE_TOOL_MODE}" == "api" && -n "${SWE_TOOL_CALL_PARSER}" ]]; then
+      tool_call_parser_args+=(--tool-call-parser "${SWE_TOOL_CALL_PARSER}")
+    fi
+  fi
   local extra_server_args_arr=()
   if [[ -n "${EXTRA_SERVER_ARGS}" ]]; then
     read -r -a extra_server_args_arr <<< "${EXTRA_SERVER_ARGS}"
@@ -387,7 +411,7 @@ start_server() {
   ' _ "${SGLANG_DIR}" "${SGLANG_ENV}" "${MODEL_PATH}" "${HOST}" "${PORT}" \
       "${SERVED_MODEL_NAME}" "${API_KEY}" "${FORCE_GREEDY_VERIFY}" \
       "${max_total_args[@]}" "${max_running_args[@]}" "${spec_args_arr[@]}" \
-      "${scope_args[@]}" "${spec_metrics_args[@]}" "${extra_server_args_arr[@]}" \
+      "${scope_args[@]}" "${spec_metrics_args[@]}" "${tool_call_parser_args[@]}" "${extra_server_args_arr[@]}" \
       >"${log_file}" 2>&1 &
   SERVER_PID="$!"
   echo "[bench-batch] server pid=${SERVER_PID} log=${log_file}"
@@ -412,8 +436,15 @@ start_gpu_sampler() {
 
 save_server_info() {
   local output="$1"
+  local tmp="${output}.tmp"
+  if curl -fsS -H "Authorization: Bearer ${API_KEY}" "${SERVER_URL}/server_info" \
+    >"${tmp}" 2>/dev/null; then
+    mv "${tmp}" "${output}"
+    return 0
+  fi
   curl -sS -H "Authorization: Bearer ${API_KEY}" "${SERVER_URL}/model_info" \
-    >"${output}" 2>/dev/null || true
+    >"${tmp}" 2>/dev/null || true
+  mv "${tmp}" "${output}" 2>/dev/null || true
 }
 
 append_result_row() {
@@ -425,27 +456,39 @@ append_result_row() {
   local gpu_log="$6"
 
   run_in_env "${BENCH_ENV}" python - "${summary_path}" "${RESULTS_CSV}" \
-    "${variant}" "${concurrency}" "${server_log}" "${server_info}" "${gpu_log}" <<'PY'
+    "${variant}" "${concurrency}" "${server_log}" "${server_info}" "${gpu_log}" \
+    "${NGRAM_DRAFT_TOKENS}" <<'PY'
 import csv
 import json
 import sys
 from pathlib import Path
 
-summary_path, csv_path, variant, concurrency, server_log, server_info, gpu_log = sys.argv[1:]
+summary_path, csv_path, variant, concurrency, server_log, server_info, gpu_log, default_draft = sys.argv[1:]
 summary = json.loads(Path(summary_path).read_text(encoding="utf-8"))
 fields = [
     "benchmark",
     "variant",
     "max_concurrency",
+    "spec_algorithm",
+    "ngram_match_type",
+    "ngram_draft_tokens",
     "model",
     "temperature",
     "top_p",
     "seed",
     "max_tokens",
+    "tool_mode",
+    "tool_choice",
+    "tool_count",
     "items",
     "turns",
     "errors",
+    "expected_tool_call_turns",
+    "generated_tool_call_turns",
+    "generated_tool_calls_total",
+    "generated_tool_name_match_turns",
     "wall_time_s",
+    "requests_s",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
@@ -453,6 +496,23 @@ fields = [
     "total_tokens_s",
     "latency_avg_s",
     "latency_max_s",
+    "latency_p50_s",
+    "latency_p90_s",
+    "latency_p99_s",
+    "accept_len_mean",
+    "spec_draft_attempts_total",
+    "spec_draft_tokens_total",
+    "spec_verified_tokens_total",
+    "spec_accepted_tokens_total",
+    "spec_rejected_tokens_total",
+    "spec_true_accept_rate",
+    "spec_true_mean_accept_len",
+    "spec_zero_accept_ratio",
+    "spec_lifetime_accept_len",
+    "spec_lifetime_accept_rate",
+    "gpu_util_avg",
+    "gpu_util_max",
+    "gpu_mem_used_max_mb",
     "trace_output",
     "output_dir",
     "server_log",
@@ -466,6 +526,169 @@ row["output_dir"] = str(Path(summary_path).parent)
 row["server_log"] = server_log
 row["server_info_path"] = server_info
 row["gpu_log"] = gpu_log
+
+def parse_variant(value, default_draft):
+    if value == "baseline":
+        return "", "", ""
+    match_type = "BFS"
+    if "prob_backmatch" in value:
+        match_type = "PROB_BACKMATCH"
+    elif "backmatch" in value:
+        match_type = "BACKMATCH"
+    elif "prob" in value:
+        match_type = "PROB"
+    draft = ""
+    marker = "_d"
+    if marker in value:
+        tail = value.rsplit(marker, 1)[-1]
+        if tail.isdigit():
+            draft = tail
+    if not draft:
+        draft = default_draft
+    return "NGRAM", match_type, draft
+
+row["spec_algorithm"], row["ngram_match_type"], row["ngram_draft_tokens"] = parse_variant(
+    variant, default_draft
+)
+
+def read_json(path_text):
+    if not path_text:
+        return {}
+    path = Path(path_text)
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {}
+
+def first_internal_state(server_info_obj):
+    states = server_info_obj.get("internal_states") or []
+    for state in states:
+        if isinstance(state, dict):
+            return state
+    return server_info_obj
+
+server_info_obj = read_json(server_info)
+internal_state = first_internal_state(server_info_obj)
+spec_summary = server_info_obj.get("spec_metrics_summary") or {}
+if not spec_summary:
+    spec_summary = internal_state.get("spec_metrics_summary") or {}
+spec_counters = spec_summary.get("SpecMetrics") or {}
+
+def metric_text(value):
+    if value is None:
+        return ""
+    return str(value)
+
+def log_key_value(key):
+    path = Path(server_log)
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+    import re
+    matches = re.findall(rf"(?m)^{re.escape(key)}=([^\s]+)", text)
+    return matches[-1] if matches else ""
+
+def counter_value(key):
+    value = metric_text(spec_counters.get(key, ""))
+    return value or log_key_value(key)
+
+lifetime_accept_len = metric_text(
+    internal_state.get("avg_spec_accept_length", server_info_obj.get("avg_spec_accept_length", ""))
+)
+draft_tokens_value = internal_state.get(
+    "speculative_num_draft_tokens",
+    server_info_obj.get("speculative_num_draft_tokens", row["ngram_draft_tokens"]),
+)
+lifetime_accept_rate = ""
+try:
+    if lifetime_accept_len != "" and float(draft_tokens_value) > 0:
+        lifetime_accept_rate = str(float(lifetime_accept_len) / float(draft_tokens_value))
+except (TypeError, ValueError):
+    pass
+
+row["accept_len_mean"] = lifetime_accept_len
+row["spec_draft_attempts_total"] = counter_value("draft_attempts_total")
+row["spec_draft_tokens_total"] = counter_value("draft_tokens_total")
+row["spec_verified_tokens_total"] = counter_value("verified_tokens_total")
+row["spec_accepted_tokens_total"] = counter_value("accepted_tokens_total")
+row["spec_rejected_tokens_total"] = counter_value("rejected_tokens_total")
+row["spec_true_accept_rate"] = counter_value("acceptance_rate")
+row["spec_true_mean_accept_len"] = counter_value("mean_accepted_tokens")
+row["spec_zero_accept_ratio"] = counter_value("zero_accept_ratio")
+row["spec_lifetime_accept_len"] = lifetime_accept_len
+row["spec_lifetime_accept_rate"] = lifetime_accept_rate
+
+def summarize_gpu(path_text):
+    path = Path(path_text)
+    if not path.is_file():
+        return {}
+    gpu_utils = []
+    mem_used = []
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore", newline="") as f:
+            reader = csv.DictReader(f)
+            for rec in reader:
+                try:
+                    gpu_utils.append(float((rec.get("gpu_util_percent") or "").strip()))
+                except ValueError:
+                    pass
+                try:
+                    mem_used.append(float((rec.get("mem_used_mb") or "").strip()))
+                except ValueError:
+                    pass
+    except Exception:
+        return {}
+    out = {}
+    if gpu_utils:
+        out["gpu_util_avg"] = round(sum(gpu_utils) / len(gpu_utils), 6)
+        out["gpu_util_max"] = round(max(gpu_utils), 6)
+    if mem_used:
+        out["gpu_mem_used_max_mb"] = round(max(mem_used), 6)
+    return out
+
+row.update(summarize_gpu(gpu_log))
+
+summary.update(
+    {
+        "variant": variant,
+        "max_concurrency": concurrency,
+        "spec_algorithm": row["spec_algorithm"],
+        "ngram_match_type": row["ngram_match_type"],
+        "ngram_draft_tokens": row["ngram_draft_tokens"],
+        "tool_mode": row.get("tool_mode", ""),
+        "tool_choice": row.get("tool_choice", ""),
+        "tool_count": row.get("tool_count", ""),
+        "expected_tool_call_turns": row.get("expected_tool_call_turns", ""),
+        "generated_tool_call_turns": row.get("generated_tool_call_turns", ""),
+        "generated_tool_calls_total": row.get("generated_tool_calls_total", ""),
+        "generated_tool_name_match_turns": row.get("generated_tool_name_match_turns", ""),
+        "accept_len_mean": row["accept_len_mean"],
+        "spec_draft_attempts_total": row["spec_draft_attempts_total"],
+        "spec_draft_tokens_total": row["spec_draft_tokens_total"],
+        "spec_verified_tokens_total": row["spec_verified_tokens_total"],
+        "spec_accepted_tokens_total": row["spec_accepted_tokens_total"],
+        "spec_rejected_tokens_total": row["spec_rejected_tokens_total"],
+        "spec_true_accept_rate": row["spec_true_accept_rate"],
+        "spec_true_mean_accept_len": row["spec_true_mean_accept_len"],
+        "spec_zero_accept_ratio": row["spec_zero_accept_ratio"],
+        "spec_lifetime_accept_len": row["spec_lifetime_accept_len"],
+        "spec_lifetime_accept_rate": row["spec_lifetime_accept_rate"],
+        "gpu_util_avg": row.get("gpu_util_avg", ""),
+        "gpu_util_max": row.get("gpu_util_max", ""),
+        "gpu_mem_used_max_mb": row.get("gpu_mem_used_max_mb", ""),
+        "server_log": server_log,
+        "server_info_path": server_info,
+        "gpu_log": gpu_log,
+    }
+)
+Path(summary_path).write_text(
+    json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+)
 
 path = Path(csv_path)
 path.parent.mkdir(parents=True, exist_ok=True)
@@ -500,43 +723,88 @@ run_one() {
 
   start_gpu_sampler "${gpu_log}"
 
-  local cmd=(
-    python "${AS_DIR}/SD_benchmark/run_benchmark.py"
-    --benchmark "${CURRENT_BENCHMARK}"
-    --benchmark-root "${BENCHMARK_ROOT}"
-    --server-url "${API_BASE}"
-    --model "${SERVED_MODEL_NAME}"
-    --api-key "${API_KEY}"
-    --temperature "${TEMPERATURE}"
-    --top-p "${TOP_P}"
-    --seed "${SEED}"
-    --max-tokens "${MAX_TOKENS}"
-    --concurrency "${concurrency}"
-    --timeout "${TIMEOUT}"
-    --humaneval-style "${HUMANEVAL_STYLE}"
-    --output-dir "${run_dir}"
-    --print-every "${PRINT_EVERY}"
-  )
-  if [[ -n "${CATEGORIES}" ]]; then
-    cmd+=(--categories "${CATEGORIES}")
-  fi
-  if [[ -n "${LIMIT}" ]]; then
-    cmd+=(--limit "${LIMIT}")
-  fi
-  if [[ -n "${EXTRA_BODY}" ]]; then
-    cmd+=(--extra-body "${EXTRA_BODY}")
-  fi
+  local cmd=()
+  case "${CURRENT_BENCHMARK}" in
+    swe_bench|swebench)
+      cmd=(
+        python "${AS_DIR}/SD_benchmark/swe_bench/run_swe_trace.py"
+        --trace-jsonl "${SWE_TRACE_JSONL}"
+        --server-url "${API_BASE}"
+        --model "${SERVED_MODEL_NAME}"
+        --api-key "${API_KEY}"
+        --temperature "${TEMPERATURE}"
+        --top-p "${TOP_P}"
+        --seed "${SEED}"
+        --max-tokens "${MAX_TOKENS}"
+        --concurrency "${concurrency}"
+        --timeout "${TIMEOUT}"
+        --output-dir "${run_dir}"
+        --server-info-output "${server_info}"
+        --print-every "${PRINT_EVERY}"
+      )
+      if [[ -n "${LIMIT}" ]]; then
+        cmd+=(--limit "${LIMIT}")
+      fi
+      if [[ -n "${MAX_STEPS_PER_WORKFLOW}" ]]; then
+        cmd+=(--max-steps-per-workflow "${MAX_STEPS_PER_WORKFLOW}")
+      fi
+      cmd+=(--tool-mode "${SWE_TOOL_MODE}")
+      if [[ "${SWE_TOOL_MODE}" == "api" ]]; then
+        cmd+=(--tool-schema "${SWE_TOOL_SCHEMA}" --tool-choice "${SWE_TOOL_CHOICE}")
+      elif [[ "${SWE_TOOL_MODE}" == "plain" ]]; then
+        cmd+=(--tool-prompt "${SWE_TOOL_PROMPT}")
+      fi
+      if [[ -n "${SWE_FAILURE_LIST_OUTPUT}" ]]; then
+        cmd+=(--failure-list-output "${SWE_FAILURE_LIST_OUTPUT}")
+      fi
+      if [[ -n "${SWE_SKIP_FAILURE_LIST}" ]]; then
+        cmd+=(--skip-failure-list "${SWE_SKIP_FAILURE_LIST}")
+      fi
+      if [[ -n "${EXTRA_BODY}" ]]; then
+        cmd+=(--extra-body "${EXTRA_BODY}")
+      fi
+      ;;
+    *)
+      cmd=(
+        python "${AS_DIR}/SD_benchmark/run_benchmark.py"
+        --benchmark "${CURRENT_BENCHMARK}"
+        --benchmark-root "${BENCHMARK_ROOT}"
+        --server-url "${API_BASE}"
+        --model "${SERVED_MODEL_NAME}"
+        --api-key "${API_KEY}"
+        --temperature "${TEMPERATURE}"
+        --top-p "${TOP_P}"
+        --seed "${SEED}"
+        --max-tokens "${MAX_TOKENS}"
+        --concurrency "${concurrency}"
+        --timeout "${TIMEOUT}"
+        --humaneval-style "${HUMANEVAL_STYLE}"
+        --output-dir "${run_dir}"
+        --print-every "${PRINT_EVERY}"
+      )
+      if [[ -n "${CATEGORIES}" ]]; then
+        cmd+=(--categories "${CATEGORIES}")
+      fi
+      if [[ -n "${LIMIT}" ]]; then
+        cmd+=(--limit "${LIMIT}")
+      fi
+      if [[ -n "${EXTRA_BODY}" ]]; then
+        cmd+=(--extra-body "${EXTRA_BODY}")
+      fi
+      ;;
+  esac
 
   echo "[bench-batch] running benchmark=${CURRENT_BENCHMARK} variant=${variant} c=${concurrency}"
   run_in_env "${BENCH_ENV}" "${cmd[@]}" | tee "${run_dir}/replay.log"
 
   cleanup_gpu_sampler
-  append_result_row "${run_dir}/summary.json" "${variant}" "${concurrency}" \
-    "${server_log}" "${server_info}" "${gpu_log}"
-
   if [[ "${START_SERVER}" == "1" ]]; then
+    save_server_info "${server_info}"
     cleanup_server
   fi
+
+  append_result_row "${run_dir}/summary.json" "${variant}" "${concurrency}" \
+    "${server_log}" "${server_info}" "${gpu_log}"
 }
 
 run_benchmark_batch() {
@@ -568,8 +836,11 @@ run_benchmark_batch() {
     done
   done
 
+  run_in_env "${BENCH_ENV}" python "${AS_DIR}/SD_benchmark/analyze_benchmark_batch.py" "${RESULTS_CSV}" --csv-output "${BATCH_DIR}/perf_summary.csv" --json-output "${BATCH_DIR}/perf_summary.json"
+
   echo "[bench-batch] done: ${BATCH_DIR}"
   echo "[bench-batch] results: ${RESULTS_CSV}"
+  echo "[bench-batch] perf_summary: ${BATCH_DIR}/perf_summary.csv"
 }
 
 main() {
