@@ -1,22 +1,18 @@
-# SWE-Bench Trajectory Traces
+# Mini-SWE-Agent Trace Replay
 
-This folder contains utilities for using downloaded OpenHands SWE-bench
-trajectories as a workflow problem-solving workload. The trajectories are not
-vendored here; keep them in an external data directory and convert them to
-JSONL traces before replay or offline analysis.
+This directory turns mini-swe-agent trajectories into a fixed, workflow-style
+serving workload for SGLang and speculative decoding experiments. It is not an
+official SWE-bench correctness evaluation: the runner does not create a
+workspace, execute generated commands, apply patches, or run tests.
 
-## Trajectory Data Source
+## Data Source
 
-Trajectory metadata comes from the SWE-bench
-[experiments repository](https://github.com/SWE-bench/experiments/tree/main/evaluation/verified).
-The repository contains verified-submission directories, while the large
-`trajs/` and `logs/` artifacts are fetched separately by its download script
-from the public `swe-bench-submissions` bucket.
-
-The current trace was extracted from the OpenHands submission
-`evaluation/verified/20250716_openhands_kimi_k2`, which contains one public
-run over 500 SWE-bench Verified tasks. No OpenHands installation, Docker
-environment, or SWE-bench execution is needed for trace extraction.
+The default workload is the public mini-swe-agent submission
+`20250803_mini-v1.0.0_qwen2-5-coder-32b-instruct` under the SWE-bench
+[experiments repository](https://github.com/SWE-bench/experiments). Submission
+metadata is stored in Git; large trajectory artifacts are downloaded by the
+repository's `analysis.download_logs` script from the public
+`swe-bench-submissions` bucket.
 
 ```bash
 git clone https://github.com/SWE-bench/experiments.git
@@ -26,156 +22,122 @@ conda create -n swe-trace python=3.11 -y
 conda activate swe-trace
 pip install boto3
 
-# Optional: list available OpenHands submissions.
-find evaluation/verified -mindepth 1 -maxdepth 1 -type d -iname "*openhands*" | sort
-
-# Verify that trajectories are available, then download them.
 python -m analysis.download_logs \
-  evaluation/verified/20250716_openhands_kimi_k2 \
+  evaluation/bash-only/20250803_mini-v1.0.0_qwen2-5-coder-32b-instruct \
   --only_trajs --test
 
 python -m analysis.download_logs \
-  evaluation/verified/20250716_openhands_kimi_k2 \
+  evaluation/bash-only/20250803_mini-v1.0.0_qwen2-5-coder-32b-instruct \
   --only_trajs
 ```
 
-The download creates
-`evaluation/verified/20250716_openhands_kimi_k2/trajs/`. This benchmark uses
-those trajectories only as a recorded serving workload; it does not reproduce
-the original agent execution or SWE-bench correctness evaluation.
+The trajectories are downloaded to:
 
-The converter treats each assistant message as one recorded LLM call. All
-messages before that assistant turn are formatted as the prompt context, and
-the assistant message text plus tool calls are saved as the recorded output.
+```text
+evaluation/bash-only/20250803_mini-v1.0.0_qwen2-5-coder-32b-instruct/trajs/
+```
 
-## Convert OpenHands Trajectories
+No SWE-bench environment, Docker installation, or mini-swe-agent installation
+is needed for conversion or replay.
 
-Example:
+## Bundled Small Trace
+
+For a quick, reproducible smoke run, this directory includes
+`mini_swe_qwen25_coder_32b_50workflows.zip`. It contains
+`mini_swe_qwen25_coder_32b_50workflows.jsonl`: all recorded LLM calls from the
+first 50 selected `Submitted` workflows, rather than a partial set of calls.
+
+```bash
+unzip -o SD_benchmark/swe_bench/mini_swe_qwen25_coder_32b_50workflows.zip \
+  -d SD_benchmark/swe_bench
+```
+
+Use the full download and conversion procedure below only when regenerating the
+trace or changing the selected source trajectories.
+
+## Trace Format
+
+mini-swe-agent uses a plain-text bash protocol rather than OpenAI function
+calling:
+
+~~~~text
+system:    requires THOUGHT plus exactly one bash command
+assistant: THOUGHT: ...
+           ```bash
+           command
+           ```
+user:      recorded command return code and output
+~~~~
+
+Each assistant turn becomes one LLM request. The next request already contains
+the original command result as a later user message. During replay, newly
+generated commands are recorded but never executed.
+
+## Convert Trajectories
+
+Only `Submitted` trajectories are retained; interrupted source runs such as
+`APIError`, `RetryError`, and `LimitsExceeded` are excluded.
 
 ```bash
 python SD_benchmark/swe_bench/extract_openhands_traces.py \
-  /mnt/d/code/swe-bench/experiments/evaluation/verified/20250716_openhands_kimi_k2/trajs \
-  --output SD_benchmark/outputs/swe_bench/openhands_kimi_k2_llm_calls.jsonl
+  /mnt/d/code/swe-bench/experiments/evaluation/bash-only/20250803_mini-v1.0.0_qwen2-5-coder-32b-instruct/trajs \
+  --only-submitted \
+  --output SD_benchmark/outputs/swe_bench/mini_swe_qwen25_coder_32b.jsonl
 ```
 
-Each JSONL row contains:
+The JSONL rows include `call_id`, `workflow_id`, `step_id`, `messages`,
+recorded `output`, prompt/output lengths, and source trajectory format/status.
 
-- `call_id`
-- `workflow_id`
-- `step_id`
-- `message_index`
-- `prompt`
-- `output`
-- `messages`
-- `tool_calls`
-- `tool_names`
-- `has_tool_call`
-- `prompt_message_count`
-- `prompt_char_length`
-- `output_char_length`
+## Replay Semantics
 
-`call_id` is a global numeric LLM-call id. `workflow_id` is a numeric
-trajectory id assigned by sorted input file order. `step_id` is the assistant
-turn id inside that workflow.
+Requests within the same workflow are submitted serially. Different workflows
+run concurrently up to `--concurrency`. Each request uses the recorded message
+history, so the workload preserves original prompt growth and causal arrival
+order while keeping later command results fixed.
 
-For assistant turns that call tools, `output` includes both the assistant text
-and a serialized `<tool_calls>` block, because the tool call is part of the
-model output for serving-workload purposes. The parsed tool calls are also kept
-separately in `tool_calls`.
-
-The normalized prompt message list is saved as `messages` by default so replay
-can preserve original roles. Use `--no-messages` only when you intentionally
-want a smaller text-only trace.
-
-This is a serving-workload trace, not an official SWE-bench correctness runner.
-It does not clone repositories, execute tools, apply patches, or run tests.
-
-## Replay Converted Traces
-
-Run against an already-running OpenAI-compatible server:
-
-```bash
-python SD_benchmark/swe_bench/run_swe_trace.py \
-  --trace-jsonl SD_benchmark/outputs/swe_bench/openhands_kimi_k2_llm_calls.jsonl \
-  --server-url http://127.0.0.1:1919/v1 \
-  --model Qwen2.5-7B-Instruct-AWQ \
-  --temperature 0 \
-  --top-p 1.0 \
-  --seed 0 \
-  --max-tokens 1024 \
-  --concurrency 1 \
-  --output-dir SD_benchmark/outputs/swe_bench_replay/smoke
-```
-
-Or let the shared batch driver start and stop SGLang for each variant:
+Use `SWE_TOOL_MODE=none`: mini-swe-agent commands are ordinary generated text,
+not OpenAI tool calls. Do not pass a tool schema or a tool-call parser.
 
 ```bash
 BENCHMARKS="swe_bench" \
-SWE_TRACE_JSONL=/mnt/d/code/AgentSociety/SD_benchmark/outputs/swe_bench/openhands_kimi_k2_llm_calls.jsonl \
-CONCURRENCIES="1 4" \
-VARIANTS="baseline ngram_d4 ngram_d8 ngram_prob_backmatch_d8" \
-MAX_TOTAL_TOKENS=32768 \
-MAX_TOKENS=1024 \
-TEMPERATURE=0 \
-TOP_P=1.0 \
-SEED=0 \
-SGLANG_ENV=sglang-v059 \
-BENCH_ENV=as \
-SGLANG_DIR=/mnt/d/code/sglang \
-AS_DIR=/mnt/d/code/AgentSociety \
+SWE_TRACE_JSONL=/mnt/d/code/AgentSociety/SD_benchmark/swe_bench/mini_swe_qwen25_coder_32b_50workflows.jsonl \
+SWE_TOOL_MODE=none \
+LIMIT=20 MAX_STEPS_PER_WORKFLOW=20 \
+CONCURRENCIES="1 4 16" \
+VARIANTS="baseline ngram_d4 ngram_d8" \
+MAX_TOTAL_TOKENS=32768 MAX_TOKENS=1024 \
+TEMPERATURE=0 TOP_P=1.0 SEED=0 \
+SGLANG_ENV=sglang-v059 BENCH_ENV=as \
+SGLANG_DIR=/mnt/d/code/sglang AS_DIR=/mnt/d/code/AgentSociety \
 bash SD_benchmark/run_benchmark_batch.sh
 ```
 
-The replay summary includes wall time, request throughput, token throughput,
-latency p50/p90/p99, and `accept_len_mean` when the SGLang build exposes it
-through `/server_info`. For speculative runs, the summary also includes true
-SGLang `SpecMetrics` counters such as `spec_true_mean_accept_len`,
-`spec_true_accept_rate`, and `spec_zero_accept_ratio`; these are not computed
-from per-batch decode log averages.
+`LIMIT` is the number of workflows, not the number of raw LLM calls.
+`MAX_STEPS_PER_WORKFLOW` caps assistant turns within every selected workflow.
 
-`--limit` in the SWE runner means number of workflows/tasks, not number of raw
-LLM-call rows. Requests inside the same workflow are sent sequentially: step 1
-is issued only after step 0 returns. Different workflows may run concurrently
-up to `--concurrency`.
+## Fixed Valid-Request Subset
 
-Use `--max-steps-per-workflow N` to replay only the first `N` LLM calls from
-each selected workflow while preserving causal order. This is useful for
-avoiding very long late-trajectory requests that exceed the server context
-limit.
-
-### Reuse a fixed valid-request subset
-
-Run a preflight once with `--failure-list-output`. The JSONL contains requests
-that error, reach `max_tokens`, or fail to complete a source tool call. Pass
-the same file with `--skip-failure-list` in later variants so they replay the
-same filtered workload. Filtering removes only that request; later trace steps
-continue to use their recorded histories.
+If the target model returns request errors or reaches `max_tokens`, first run a
+reference preflight over the full selected trace and write a failure list.
+Reuse that exact list for baseline and every SD variant; do not create a
+different list for each strategy.
 
 ```bash
-python SD_benchmark/swe_bench/run_swe_trace.py ... \
-  --failure-list-output SD_benchmark/outputs/swe_bench/failures_qwen_api.jsonl
+# Preflight.
+SWE_FAILURE_LIST_OUTPUT=/path/to/mini_swe_failures.jsonl \
+VARIANTS="baseline" \
+bash SD_benchmark/run_benchmark_batch.sh
 
-python SD_benchmark/swe_bench/run_swe_trace.py ... \
-  --skip-failure-list SD_benchmark/outputs/swe_bench/failures_qwen_api.jsonl
+# Matched comparison.
+SWE_SKIP_FAILURE_LIST=/path/to/mini_swe_failures.jsonl \
+VARIANTS="baseline ngram_d4 ngram_d8" \
+bash SD_benchmark/run_benchmark_batch.sh
 ```
 
-For output behavior, the runner uses the recorded `messages` field when present
-instead of wrapping the whole formatted prompt as a single user message. This is
-closer to the original OpenHands chat structure. If the converted JSONL was
-created with an older converter and has no `messages`, the runner falls back to
-the text `prompt` field.
+The output summary records request counts, skipped failures, wall time, token
+throughput, latency percentiles, GPU utilization, and SGLang speculative
+metrics. Report retained-request coverage with every filtered result.
 
-The generated `output` field is the response from the model under test and is
-saved for inspection only. It is not appended to later workflow requests. For
-trace-based datastore construction or offline SD analysis, use `recorded_output`
-from the original trajectory.
-
-By default replay uses
-`swe_bench/tool_definitions/tools_schema.json` as the OpenAI-compatible
-`tools` request field and sends `tool_choice=required`. The batch driver starts
-SGLang with `--tool-call-parser qwen` for this mode, so generated calls are
-recorded in `generated_tool_calls` rather than only as unstructured text. The
-runner still does not execute these calls; it uses the recorded tool results in
-later prompts. Use `SWE_TOOL_MODE=plain` to append
-`openhands_tools_plain_prompt.md` to the system message for an explicit
-plain-text comparison, or `SWE_TOOL_MODE=none` for chat-only replay.
+The converter can also read other message-based agent traces, including legacy
+OpenHands trajectories, but those may require an explicit tool-calling mode and
+are not the default workload documented here.

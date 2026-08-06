@@ -10,8 +10,8 @@ workload comparison, not official benchmark scoring.
 - `mt_bench/`: two-turn MT-Bench-style chat prompts.
 - `spec_bench/`: multi-category Spec-Bench-style prompts, including writing,
   coding, math, summarization, translation, RAG, and related tasks.
-- `swe_bench/`: trace-replay workload built from OpenHands SWE-bench coding
-  trajectories.
+- `swe_bench/`: trace-replay workload built from mini-swe-agent SWE-bench
+  coding trajectories.
 
 The runner records full request/response traces so speculative decoding
 behavior can be analyzed later.
@@ -54,77 +54,18 @@ concurrency setting.
 columns for existing batch results when the run directories already contain
 `server_info.json` captured from `/server_info`.
 
-## SWE-Bench OpenHands Trace Replay
+## Mini-SWE-Agent Trace Replay
 
 `swe_bench/` is a **serving workload**, not an official SWE-Bench evaluation.
-It measures the serving cost of agent-style, tool-using LLM requests under
-baseline and speculative-decoding configurations. It does not execute tools,
-apply patches, run tests, or report SWE-Bench solve rates.
+It replays public mini-swe-agent trajectories as causal, multi-turn coding
+workflows. Each assistant turn contains plain text (`THOUGHT` plus one bash
+command), and the next prompt contains the original recorded command result.
 
-### What Is Replayed
-
-The source is an OpenHands trajectory produced by another model. The converter
-extracts every assistant turn as one LLM request and stores its
-`workflow_id`, `step_id`, full chat `messages`, recorded output, and source
-tool-call metadata.
-
-During replay:
-
-1. Steps in the same `workflow_id` are submitted serially: a later step starts
-   only after the preceding replay request returns.
-2. Different workflows run concurrently up to `--concurrency`.
-3. Each request uses its recorded message history. The model output generated
-   during replay is recorded for inspection but is **not** executed and is not
-   appended to later requests; later prompts retain the original recorded tool
-   results.
-
-This preserves the prompt sizes, tool-result history, and causal arrival
-structure of the original agent workload while making the request stream fixed
-enough for serving-performance comparison.
-
-### Tools and Valid-Request Filtering
-
-By default, replay sends the three observed OpenHands tools (`think`,
-`execute_bash`, and `str_replace_editor`) through the OpenAI-compatible
-`tools` field using
-[`swe_bench/tool_definitions/tools_schema.json`](swe_bench/tool_definitions/tools_schema.json).
-The batch driver starts SGLang with `--tool-call-parser qwen`; generated calls
-are saved in `generated_tool_calls`, but never executed.
-
-Some model/server configurations may fail to complete a tool-call JSON for a
-small subset of requests. To make performance variants comparable, first run a
-reference preflight over the full selected trace and export its failure list.
-Then import that same list for every baseline and SD variant. Do not create a
-separate list per variant.
-
-```bash
-# 1. Reference preflight: run all selected requests and record failures.
-BENCHMARKS="swe_bench" \
-SWE_TRACE_JSONL=/path/to/openhands_llm_calls.jsonl \
-LIMIT=20 MAX_STEPS_PER_WORKFLOW=20 \
-CONCURRENCIES="4" VARIANTS="baseline" MAX_TOKENS=512 \
-SWE_FAILURE_LIST_OUTPUT=/path/to/failures_qwen_api.jsonl \
-SGLANG_ENV=sglang-v059 BENCH_ENV=as \
-SGLANG_DIR=/mnt/d/code/sglang AS_DIR=/mnt/d/code/AgentSociety \
-bash SD_benchmark/run_benchmark_batch.sh
-
-# 2. Compare variants on the identical valid-request subset.
-BENCHMARKS="swe_bench" \
-SWE_TRACE_JSONL=/path/to/openhands_llm_calls.jsonl \
-LIMIT=20 MAX_STEPS_PER_WORKFLOW=20 \
-CONCURRENCIES="1 4 16" VARIANTS="baseline ngram_d4 ngram_d8" MAX_TOKENS=512 \
-SWE_SKIP_FAILURE_LIST=/path/to/failures_qwen_api.jsonl \
-SGLANG_ENV=sglang-v059 BENCH_ENV=as \
-SGLANG_DIR=/mnt/d/code/sglang AS_DIR=/mnt/d/code/AgentSociety \
-bash SD_benchmark/run_benchmark_batch.sh
-```
-
-The output summary records `source_calls`, `skipped_failure_calls`, tool-call
-completion counters, wall time, token throughput, latency percentiles, GPU
-utilization, and SGLang speculative metrics. Report the retained-request
-coverage with every filtered SWE result. See
-[`swe_bench/README.md`](swe_bench/README.md) for trace conversion and runner
-arguments.
+During replay, workflow steps are serial, workflows may run concurrently, and
+generated commands are recorded but not executed. Set `SWE_TOOL_MODE=none`:
+this workload does not use OpenAI tool calls, schemas, or a tool-call parser.
+The conversion command, data download procedure, preflight filtering protocol,
+and full batch command are in [`swe_bench/README.md`](swe_bench/README.md).
 
 Supported variants include:
 
