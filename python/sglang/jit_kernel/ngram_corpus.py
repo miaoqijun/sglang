@@ -74,6 +74,20 @@ def get_ngram_corpus_cls():
             tokens_flat, offsets = _to_csr(batch_tokens)
             return int(self.async_insert(tokens_flat, offsets))  # type: ignore
 
+        def insert_with_csr(
+            self, batch_tokens: List[List[int]]
+        ) -> Tuple[int, np.ndarray, np.ndarray]:
+            """Insert a local batch and expose the exact CSR used by the FFI.
+
+            The returned NumPy arrays share storage with the CPU tensors passed
+            to ``async_insert``.  Keeping those arrays alive therefore lets the
+            mmap publisher reuse the already-built CSR without walking the
+            Python token lists a second time.
+            """
+            tokens_flat, offsets = _to_csr(batch_tokens)
+            ticket = int(self.async_insert(tokens_flat, offsets))  # type: ignore
+            return ticket, tokens_flat.numpy(), offsets.numpy()
+
         def match_stateful(
             self,
             state_ids: List[int],

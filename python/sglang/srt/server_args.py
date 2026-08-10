@@ -1587,6 +1587,42 @@ class ServerArgs:
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    speculative_ngram_l2_history_path: A[
+        Optional[str],
+        "Root directory for the native mmap rings used for cross-instance NGRAM history replication.",
+    ] = None
+    speculative_ngram_l2_mmap_capacity: A[
+        int,
+        "Number of fixed 128-byte window slots in each writer's NGRAM mmap ring.",
+    ] = 65536
+    speculative_ngram_l2_namespace: A[
+        Optional[str],
+        "Namespace for NGRAM L2 rings. Defaults to a model and NGRAM config derived namespace.",
+    ] = None
+    speculative_ngram_l2_instance_id: A[
+        Optional[str],
+        "Writer id for this instance in NGRAM L2 history. Defaults to host, pid, TP rank, and DP rank.",
+    ] = None
+    speculative_ngram_l2_push_max_records: A[
+        int,
+        "Maximum number of NGRAM history records to write to L2 in one background flush.",
+    ] = 256
+    speculative_ngram_l2_pull_interval_ms: A[
+        int,
+        "Background poll interval in milliseconds for pulling remote NGRAM history from L2.",
+    ] = 200
+    speculative_ngram_l2_import_max_records_per_step: A[
+        int,
+        "Maximum number of pulled NGRAM L2 history records to import into local L1 per draft step.",
+    ] = 512
+    speculative_ngram_l2_import_max_tokens_per_step: A[
+        int,
+        "Maximum number of pulled NGRAM L2 history tokens to import into local L1 per draft step.",
+    ] = 8192
+    speculative_ngram_l2_start_from_beginning: A[
+        bool,
+        "If set, read existing file-backed NGRAM L2 history from the beginning at startup instead of tailing only new records.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Expert parallelism

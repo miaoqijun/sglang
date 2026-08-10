@@ -15,6 +15,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.eagle_utils import eagle_sample
+from sglang.srt.speculative.ngram_history import NgramHistoryReplicator
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_utils import (
     commit_mamba_states_after_verify,
@@ -172,6 +173,17 @@ class NGRAMWorker(BaseSpecWorker):
             external_sam_budget=server_args.speculative_ngram_external_sam_budget,
             external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
         )
+        self.ngram_history_replicator = NgramHistoryReplicator.from_server_args(
+            server_args,
+            tp_rank=tp_rank,
+            dp_rank=dp_rank,
+            remote_epoch_sink=self._stage_remote_windows_sink,
+        )
+        if self.ngram_history_replicator is not None:
+            logger.info(
+                "NGRAM L2 uses full-window native mmap replication with "
+                "verify-overlapped remote insertion."
+            )
         if server_args.speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
                 iter_external_corpus_chunks,
@@ -203,8 +215,16 @@ class NGRAMWorker(BaseSpecWorker):
         return None
 
     def clear_cache_pool(self):
-        self.ngram_corpus.synchronize()
-        self.ngram_corpus.reset()
+        if self.ngram_history_replicator is not None:
+            self.ngram_history_replicator.pause_remote_sink()
+        try:
+            # Reset is a low-frequency control operation: unlike decode, it
+            # fences both domains while background staging is paused.
+            self.ngram_corpus.synchronize()
+            self.ngram_corpus.reset()
+        finally:
+            if self.ngram_history_replicator is not None:
+                self.ngram_history_replicator.resume_remote_sink()
         self._prev_decode_rids = set()
         self._last_local_ticket = 0
 
@@ -296,10 +316,35 @@ class NGRAMWorker(BaseSpecWorker):
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
     def get_ngram_runtime_stats(self) -> dict[str, object]:
+        """Return a read-only snapshot without draining or fencing L2."""
+        replicator_stats = None
+        replicator = self.ngram_history_replicator
+        if replicator is not None:
+            backend_stats_fn = getattr(replicator.backend, "stats", None)
+            backend_stats = (
+                backend_stats_fn() if callable(backend_stats_fn) else None
+            )
+            replicator_stats = {
+                "pushed_records": replicator.pushed_records,
+                "pulled_records": replicator.pulled_records,
+                "imported_records": replicator.imported_records,
+                "dropped_push_records": replicator.dropped_push_records,
+                "dropped_import_records": replicator.dropped_import_records,
+                "published_batches": replicator.published_batches,
+                "published_tokens": replicator.published_tokens,
+                "push_loop_wakeups": replicator.push_loop_wakeups,
+                "push_loop_flush_calls": replicator.push_loop_flush_calls,
+                "push_loop_empty_wakeups": replicator.push_loop_empty_wakeups,
+                "backend_stats": backend_stats,
+            }
+
         return {
-            "replicator": None,
+            "replicator": replicator_stats,
             "insert_stats": self.ngram_corpus.insert_stats(),
         }
+
+    def _stage_remote_windows_sink(self, flat_tokens, offsets) -> int:
+        return self.ngram_corpus.stage_remote_windows(flat_tokens, offsets)
 
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
@@ -463,7 +508,17 @@ class NGRAMWorker(BaseSpecWorker):
             )
             batch_tokens.append(put_ids)
             i += 1
-        self._last_local_ticket = self.ngram_corpus.batch_put(batch_tokens)
+        if self.ngram_history_replicator is not None:
+            (
+                self._last_local_ticket,
+                flat_tokens,
+                offsets,
+            ) = self.ngram_corpus.batch_put_with_csr(batch_tokens)
+            self.ngram_history_replicator.enqueue_push(
+                flat_tokens, offsets
+            )
+        else:
+            self._last_local_ticket = self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None

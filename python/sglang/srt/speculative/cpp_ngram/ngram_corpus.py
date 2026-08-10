@@ -54,6 +54,13 @@ class NgramCorpus:
     def batch_put(self, batch_tokens: List[List[int]]) -> int:
         return int(self._obj.insert(batch_tokens))
 
+    def batch_put_with_csr(
+        self, batch_tokens: List[List[int]]
+    ) -> tuple[int, np.ndarray, np.ndarray]:
+        """Insert locally and return the same CSR buffers used by the insert."""
+        ticket, flat_tokens, offsets = self._obj.insert_with_csr(batch_tokens)
+        return int(ticket), flat_tokens, offsets
+
     def stage_remote_windows(
         self, flat_tokens: np.ndarray, offsets: np.ndarray
     ) -> int:
