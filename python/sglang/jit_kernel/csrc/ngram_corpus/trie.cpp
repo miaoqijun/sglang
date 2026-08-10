@@ -19,6 +19,7 @@ Trie::Trie(size_t capacity, const Param& param) : param_(param) {
 }
 
 void Trie::insert(const int32_t* tokens, size_t len) {
+  ++insert_stats_.window_records;
   for (size_t i = 0; i < len; ++i) {
     auto start = tokens + i;
     auto end = start + std::min(len - i, param_.max_trie_depth);
@@ -30,6 +31,7 @@ void Trie::insert(const int32_t* tokens, size_t len) {
     TrieNode* cursor = root_;
     path_.clear();
     while (start != end) {
+      ++insert_stats_.window_edge_visits;
       auto token = *start;
       auto iter = cursor->child.find(token);
       if (iter == cursor->child.end()) {
@@ -65,6 +67,8 @@ void Trie::insert(const int32_t* tokens, size_t len) {
 }
 
 void Trie::squeeze(size_t count) {
+  ++insert_stats_.squeeze_calls;
+  insert_stats_.squeezed_nodes += count;
   if (!(node_pool_.size() >= free_node_count_ + count)) {
     throw std::runtime_error(
         "Insufficient node size to release required nodes. "
@@ -102,6 +106,7 @@ void Trie::reset() {
   }
   free_node_count_ = node_pool_.size();
   root_ = getNode();
+  insert_stats_ = {};
 }
 
 const TrieNode* Trie::resolve(const MatchState& state, const NodeRef& ref) const {

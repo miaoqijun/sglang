@@ -1,7 +1,9 @@
 #include "ngram.h"
 
 #include "trie.h"
+#include <chrono>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -42,25 +44,156 @@ Ngram::Ngram(size_t capacity, const Param& param) : param_(param) {
 }
 
 Ngram::~Ngram() {
-  insert_queue_.close();
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    insert_worker_closed_ = true;
+  }
+  work_cv_.notify_all();
   if (insert_worker_.joinable()) {
     insert_worker_.join();
   }
 }
 
-void Ngram::synchronize() const {
-  std::unique_lock<std::mutex> lock(mutex_);
-  sync_cv_.wait(lock, [this] { return pending_count_ == 0; });
+void Ngram::synchronize() {
+  uint64_t local_ticket;
+  uint64_t remote_ticket;
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    if (!staged_remote_.empty()) {
+      released_remote_ticket_ = staged_remote_.back().epoch->ticket;
+      ready_remote_.splice(ready_remote_.end(), staged_remote_);
+    }
+    local_ticket = next_local_ticket_;
+    remote_ticket = released_remote_ticket_;
+  }
+  work_cv_.notify_one();
+  waitLocal(local_ticket);
+  waitRemote(remote_ticket);
 }
 
-void Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+void Ngram::waitLocal(uint64_t ticket) const {
+  if (ticket == 0) return;
+  std::unique_lock<std::mutex> lock(completion_mutex_);
+  completion_cv_.wait(lock, [this, ticket] {
+    return completed_local_ticket_ >= ticket;
+  });
+}
+
+void Ngram::waitRemote(uint64_t ticket) const {
+  if (ticket == 0) return;
+  std::unique_lock<std::mutex> lock(completion_mutex_);
+  completion_cv_.wait(lock, [this, ticket] {
+    return completed_remote_ticket_ >= ticket;
+  });
+}
+
+bool Ngram::remoteReady(uint64_t ticket) const {
+  if (ticket == 0) return true;
+  std::lock_guard<std::mutex> lock(completion_mutex_);
+  return completed_remote_ticket_ >= ticket;
+}
+
+uint64_t Ngram::submitLocalEpoch(std::vector<InsertTask>&& tasks) {
+  if (tasks.empty()) {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    return next_local_ticket_;
+  }
+  uint64_t ticket;
   {
-    std::lock_guard<std::mutex> lock(mutex_);
-    pending_count_ += tokens.size();
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    if (insert_worker_closed_) {
+      throw std::runtime_error("NGRAM insert worker is closed");
+    }
+    ticket = ++next_local_ticket_;
+    auto epoch = std::make_shared<InsertEpoch>();
+    epoch->ticket = ticket;
+    epoch->remote = false;
+    epoch->tasks = std::move(tasks);
+    ready_local_.push_back(EpochCursor{std::move(epoch), 0});
   }
+  work_cv_.notify_one();
+  return ticket;
+}
+
+uint64_t Ngram::asyncInsert(std::vector<std::vector<int32_t>>&& tokens) {
+  std::vector<InsertTask> tasks;
+  tasks.reserve(tokens.size());
   for (auto&& token : tokens) {
-    insert_queue_.enqueue(std::move(token));
+    tasks.push_back(InsertTask{std::move(token)});
   }
+  return submitLocalEpoch(std::move(tasks));
+}
+
+uint64_t Ngram::stageRemoteEpoch(std::vector<std::vector<int32_t>>&& windows) {
+  std::vector<InsertTask> tasks;
+  tasks.reserve(windows.size());
+  for (auto&& tokens : windows) {
+    tasks.push_back(InsertTask{std::move(tokens)});
+  }
+  if (tasks.empty()) {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    return next_remote_ticket_;
+  }
+
+  uint64_t ticket;
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    if (insert_worker_closed_) {
+      throw std::runtime_error("NGRAM insert worker is closed");
+    }
+    ticket = ++next_remote_ticket_;
+    auto epoch = std::make_shared<InsertEpoch>();
+    epoch->ticket = ticket;
+    epoch->remote = true;
+    epoch->tasks = std::move(tasks);
+    staged_remote_.push_back(EpochCursor{std::move(epoch), 0});
+  }
+  return ticket;
+}
+
+uint64_t Ngram::releaseRemoteEpochs() {
+  uint64_t ticket = 0;
+  {
+    std::lock_guard<std::mutex> lock(work_mutex_);
+    if (!staged_remote_.empty()) {
+      released_remote_ticket_ = staged_remote_.back().epoch->ticket;
+      ready_remote_.splice(ready_remote_.end(), staged_remote_);
+      ticket = released_remote_ticket_;
+    }
+  }
+  work_cv_.notify_one();
+  return ticket;
+}
+
+std::string Ngram::insertStatsJson() const {
+  std::unique_lock<std::mutex> lock(mutex_);
+  std::unique_lock<std::mutex> work_lock(work_mutex_);
+  std::unique_lock<std::mutex> completion_lock(completion_mutex_);
+  const auto& stats = trie_->insertStats();
+  std::ostringstream out;
+  out << "{"
+      << "\"window_tasks\":" << window_insert_tasks_ << ","
+      << "\"window_insert_ns\":" << window_insert_ns_ << ","
+      << "\"local_submitted_ticket\":" << next_local_ticket_ << ","
+      << "\"local_completed_ticket\":" << completed_local_ticket_ << ","
+      << "\"remote_staged_ticket\":" << next_remote_ticket_ << ","
+      << "\"remote_released_ticket\":" << released_remote_ticket_ << ","
+      << "\"remote_completed_ticket\":" << completed_remote_ticket_ << ","
+      << "\"staged_remote_epochs\":" << staged_remote_.size() << ","
+      << "\"ready_remote_epochs\":" << ready_remote_.size() << ","
+      << "\"ready_local_epochs\":" << ready_local_.size() << ","
+      << "\"local_epoch_tasks\":" << local_epoch_tasks_ << ","
+      << "\"remote_epoch_tasks\":" << remote_epoch_tasks_ << ","
+      << "\"local_epoch_edge_visits\":" << local_epoch_edge_visits_ << ","
+      << "\"remote_epoch_edge_visits\":" << remote_epoch_edge_visits_ << ","
+      << "\"local_epoch_service_ns\":" << local_epoch_service_ns_ << ","
+      << "\"remote_epoch_service_ns\":" << remote_epoch_service_ns_ << ","
+      << "\"window_records\":" << stats.window_records << ","
+      << "\"window_edge_visits\":" << stats.window_edge_visits << ","
+      << "\"squeeze_calls\":" << stats.squeeze_calls << ","
+      << "\"squeezed_nodes\":" << stats.squeezed_nodes
+      << "}";
+  return out.str();
 }
 
 // NOTE: staging operations (start/append/finish) are called from a background
@@ -127,15 +260,64 @@ std::vector<std::pair<std::string, int64_t>> Ngram::listExternalCorpora() const 
 
 void Ngram::insertWorker() {
   for (;;) {
-    std::vector<int32_t> data;
-    if (!insert_queue_.dequeue(data)) {
-      break;
+    std::shared_ptr<const InsertEpoch> epoch;
+    size_t task_index = 0;
+    bool epoch_complete = false;
+    {
+      std::unique_lock<std::mutex> lock(work_mutex_);
+      work_cv_.wait(lock, [this] {
+        return insert_worker_closed_ || !ready_local_.empty() || !ready_remote_.empty();
+      });
+      if (insert_worker_closed_) break;
+
+      // Re-evaluate this choice after every task.  This is the key invariant
+      // that keeps local progress independent of an arbitrarily long remote
+      // epoch while preserving FIFO order within the remote domain.
+      auto* cursor = !ready_local_.empty() ? &ready_local_.front() : &ready_remote_.front();
+      epoch = cursor->epoch;
+      task_index = cursor->next_task++;
+      epoch_complete = cursor->next_task == epoch->tasks.size();
+      if (epoch_complete) {
+        if (epoch->remote) {
+          ready_remote_.pop_front();
+        } else {
+          ready_local_.pop_front();
+        }
+      }
     }
-    std::unique_lock<std::mutex> lock(mutex_);
-    trie_->insert(data.data(), data.size());
-    --pending_count_;
-    lock.unlock();
-    sync_cv_.notify_all();
+
+    const auto& task = epoch->tasks[task_index];
+    const auto start = std::chrono::steady_clock::now();
+    uint64_t edge_visits_delta = 0;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      const uint64_t before_edge_visits = trie_->insertStats().window_edge_visits;
+      trie_->insert(task.tokens.data(), task.tokens.size());
+      ++window_insert_tasks_;
+      const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - start);
+      window_insert_ns_ += static_cast<uint64_t>(elapsed.count());
+      edge_visits_delta = trie_->insertStats().window_edge_visits - before_edge_visits;
+    }
+    const auto service_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start)
+            .count());
+    {
+      std::lock_guard<std::mutex> lock(completion_mutex_);
+      if (epoch->remote) {
+        ++remote_epoch_tasks_;
+        remote_epoch_edge_visits_ += edge_visits_delta;
+        remote_epoch_service_ns_ += service_ns;
+        if (epoch_complete) completed_remote_ticket_ = epoch->ticket;
+      } else {
+        ++local_epoch_tasks_;
+        local_epoch_edge_visits_ += edge_visits_delta;
+        local_epoch_service_ns_ += service_ns;
+        if (epoch_complete) completed_local_ticket_ = epoch->ticket;
+      }
+    }
+    if (epoch_complete) completion_cv_.notify_all();
   }
 }
 

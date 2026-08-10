@@ -53,11 +53,22 @@ struct MatchState {
   std::vector<NodeRef> anchors;
 };
 
+struct TrieInsertStats {
+  uint64_t window_records = 0;
+  uint64_t window_edge_visits = 0;
+  uint64_t squeeze_calls = 0;
+  uint64_t squeezed_nodes = 0;
+};
+
 class Trie {
  public:
   Trie(size_t capacity, const Param& param);
 
   void insert(const int32_t* tokens, size_t len);
+
+  const TrieInsertStats& insertStats() const {
+    return insert_stats_;
+  }
 
   Result buildRecency(
       const int32_t* context,
@@ -137,6 +148,7 @@ class Trie {
   std::vector<TrieNode*> path_;
   Param param_;
   uint64_t trie_epoch_ = 1;
+  TrieInsertStats insert_stats_;
 };
 
 }  // namespace ngram

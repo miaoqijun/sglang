@@ -39,7 +39,7 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_ = std::make_unique<ngram::Ngram>(static_cast<size_t>(capacity), param);
   }
 
-  void async_insert(const tvm::ffi::TensorView tokens_flat, const tvm::ffi::TensorView offsets) {
+  int64_t async_insert(const tvm::ffi::TensorView tokens_flat, const tvm::ffi::TensorView offsets) {
     auto* data = static_cast<const int32_t*>(tokens_flat.data_ptr());
     auto* offs = static_cast<const int64_t*>(offsets.data_ptr());
     int64_t batch_size = offsets.size(0) - 1;
@@ -48,7 +48,21 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     for (int64_t i = 0; i < batch_size; ++i) {
       tokens[i].assign(data + offs[i], data + offs[i + 1]);
     }
-    ngram_->asyncInsert(std::move(tokens));
+    return static_cast<int64_t>(ngram_->asyncInsert(std::move(tokens)));
+  }
+
+  int64_t stage_remote_windows(
+      const tvm::ffi::TensorView windows_flat,
+      const tvm::ffi::TensorView window_offsets) {
+    auto* window_data = static_cast<const int32_t*>(windows_flat.data_ptr());
+    auto* window_offs = static_cast<const int64_t*>(window_offsets.data_ptr());
+    const int64_t window_count = window_offsets.size(0) - 1;
+    std::vector<std::vector<int32_t>> windows(window_count);
+    for (int64_t i = 0; i < window_count; ++i) {
+      windows[i].assign(window_data + window_offs[i], window_data + window_offs[i + 1]);
+    }
+
+    return static_cast<int64_t>(ngram_->stageRemoteEpoch(std::move(windows)));
   }
 
   void batch_match_stateful(
@@ -124,6 +138,26 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_->synchronize();
   }
 
+  int64_t release_remote_epochs() {
+    return static_cast<int64_t>(ngram_->releaseRemoteEpochs());
+  }
+
+  void wait_local(int64_t ticket) {
+    ngram_->waitLocal(static_cast<uint64_t>(ticket));
+  }
+
+  void wait_remote(int64_t ticket) {
+    ngram_->waitRemote(static_cast<uint64_t>(ticket));
+  }
+
+  bool remote_ready(int64_t ticket) {
+    return ngram_->remoteReady(static_cast<uint64_t>(ticket));
+  }
+
+  std::string insert_stats_json() {
+    return ngram_->insertStatsJson();
+  }
+
   void reset() {
     ngram_->reset();
   }
@@ -155,6 +189,7 @@ void register_ngram_corpus() {
   refl::ObjectDef<NgramCorpusObj>()
       .def(refl::init<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>(), "__init__")
       .def("async_insert", &NgramCorpusObj::async_insert)
+      .def("stage_remote_windows", &NgramCorpusObj::stage_remote_windows)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
@@ -165,6 +200,11 @@ void register_ngram_corpus() {
       .def("clear_external_corpus", &NgramCorpusObj::clear_external_corpus)
       .def("list_external_corpora", &NgramCorpusObj::list_external_corpora)
       .def("synchronize", &NgramCorpusObj::synchronize)
+      .def("release_remote_epochs", &NgramCorpusObj::release_remote_epochs)
+      .def("wait_local", &NgramCorpusObj::wait_local)
+      .def("wait_remote", &NgramCorpusObj::wait_remote)
+      .def("remote_ready", &NgramCorpusObj::remote_ready)
+      .def("insert_stats_json", &NgramCorpusObj::insert_stats_json)
       .def("reset", &NgramCorpusObj::reset);
 }
 

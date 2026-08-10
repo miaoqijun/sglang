@@ -160,6 +160,7 @@ class NGRAMWorker(BaseSpecWorker):
         # rids of the last decode batch; used to erase corpus match state for
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
+        self._last_local_ticket = 0
 
         self.ngram_corpus = NgramCorpus(
             min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
@@ -202,8 +203,10 @@ class NGRAMWorker(BaseSpecWorker):
         return None
 
     def clear_cache_pool(self):
+        self.ngram_corpus.synchronize()
         self.ngram_corpus.reset()
         self._prev_decode_rids = set()
+        self._last_local_ticket = 0
 
     def update_weights_from_tensor(self, recv_req):
         # NGRAM has no draft weights of its own — the n-gram corpus is a CPU
@@ -292,6 +295,12 @@ class NGRAMWorker(BaseSpecWorker):
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(num_correct_drafts_per_req)
 
+    def get_ngram_runtime_stats(self) -> dict[str, object]:
+        return {
+            "replicator": None,
+            "insert_stats": self.ngram_corpus.insert_stats(),
+        }
+
     def _prepare_draft_tokens(
         self, batch: ScheduleBatch
     ) -> tuple[np.ndarray, np.ndarray]:
@@ -310,7 +319,8 @@ class NGRAMWorker(BaseSpecWorker):
         self.prev_token_ids = prev_token_ids.tolist()
         self.prev_accept_lens = prev_accept_lens.tolist()
 
-        self.ngram_corpus.synchronize()
+        if self._last_local_ticket:
+            self.ngram_corpus.wait_local(self._last_local_ticket)
         req_ids = []
         batch_tokens = []
         total_lens = []
@@ -453,7 +463,7 @@ class NGRAMWorker(BaseSpecWorker):
             )
             batch_tokens.append(put_ids)
             i += 1
-        self.ngram_corpus.batch_put(batch_tokens)
+        self._last_local_ticket = self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None
@@ -477,6 +487,10 @@ class NGRAMWorker(BaseSpecWorker):
                 draft_tokens_cpu = verify_input.draft_token.view(
                     verify_input.retrieve_next_token.shape
                 ).cpu()
+
+            # Freeze the current staged prefix after this step's match, then
+            # overlap its native insertion with target verification.
+            self.ngram_corpus.release_remote_epochs()
 
             batch_result = self.target_worker.forward_batch_generation(
                 batch, is_verify=True

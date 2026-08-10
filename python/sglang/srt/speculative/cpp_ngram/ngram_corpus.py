@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 
+import json
 import logging
 from collections.abc import Iterable, Sequence
 from typing import Dict, List, Tuple
 
 import numpy as np
+import torch
 
 from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
 
@@ -49,11 +51,52 @@ class NgramCorpus:
             self._req_id_to_state_id[req_id] = sid
         return sid
 
-    def batch_put(self, batch_tokens: List[List[int]]):
-        self._obj.insert(batch_tokens)
+    def batch_put(self, batch_tokens: List[List[int]]) -> int:
+        return int(self._obj.insert(batch_tokens))
+
+    def stage_remote_windows(
+        self, flat_tokens: np.ndarray, offsets: np.ndarray
+    ) -> int:
+        """Stage a prepacked window CSR batch without Python token objects."""
+        if (
+            flat_tokens.dtype != np.int32
+            or flat_tokens.ndim != 1
+            or not flat_tokens.flags.c_contiguous
+        ):
+            raise ValueError("packed window tokens must be contiguous int32")
+        if (
+            offsets.dtype != np.int64
+            or offsets.ndim != 1
+            or not offsets.flags.c_contiguous
+            or offsets.size == 0
+        ):
+            raise ValueError("packed window offsets must be contiguous int64")
+        if int(offsets[0]) != 0 or int(offsets[-1]) != flat_tokens.size:
+            raise ValueError("packed window offsets do not cover the token buffer")
+        return int(
+            self._obj.stage_remote_windows(  # type: ignore
+                torch.from_numpy(flat_tokens),
+                torch.from_numpy(offsets),
+            )
+        )
+
+    def insert_stats(self) -> dict:
+        return json.loads(self._obj.insert_stats_json())  # type: ignore
 
     def synchronize(self):
         self._obj.synchronize()  # type: ignore
+
+    def release_remote_epochs(self) -> int:
+        return int(self._obj.release_remote_epochs())  # type: ignore
+
+    def wait_local(self, ticket: int) -> None:
+        self._obj.wait_local(int(ticket))  # type: ignore
+
+    def wait_remote(self, ticket: int) -> None:
+        self._obj.wait_remote(int(ticket))  # type: ignore
+
+    def remote_ready(self, ticket: int) -> bool:
+        return bool(self._obj.remote_ready(int(ticket)))  # type: ignore
 
     @property
     def remaining_token_budget(self) -> int:

@@ -3692,6 +3692,12 @@ class Scheduler(
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.metrics_reporter.step_time_dict
 
+        get_ngram_runtime_stats = getattr(
+            self.draft_worker, "get_ngram_runtime_stats", None
+        )
+        if callable(get_ngram_runtime_stats):
+            ret["ngram_runtime_stats"] = get_ngram_runtime_stats()
+
         # This field is not serializable.
         ret.pop("model_config", None)
 

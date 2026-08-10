@@ -70,9 +70,9 @@ def get_ngram_corpus_cls():
             )
             self._draft_token_num = draft_token_num
 
-        def insert(self, batch_tokens: List[List[int]]) -> None:
+        def insert(self, batch_tokens: List[List[int]]) -> int:
             tokens_flat, offsets = _to_csr(batch_tokens)
-            self.async_insert(tokens_flat, offsets)  # type: ignore
+            return int(self.async_insert(tokens_flat, offsets))  # type: ignore
 
         def match_stateful(
             self,
