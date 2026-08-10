@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import json
 import sys
 import threading
@@ -47,6 +48,13 @@ class BenchmarkItem:
     category: str
     turns: tuple[str, ...]
     source: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class TeacherForcingTurn:
+    output: str
+    token_ids: tuple[int, ...]
+    completion_tokens: int
 
 
 def normalize_benchmark_name(value: str) -> str:
@@ -249,10 +257,55 @@ def usage_value(response: dict[str, Any] | None, key: str) -> int | None:
         return None
 
 
+def response_meta_info(response: dict[str, Any] | None) -> dict[str, Any]:
+    if not response:
+        return {}
+    choices = response.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return {}
+    value = choices[0].get("meta_info")
+    return value if isinstance(value, dict) else {}
+
+
+def load_teacher_forcing_turns(
+    trace_path: Path,
+    *,
+    tokenizer_path: str,
+) -> dict[tuple[str, int], TeacherForcingTurn]:
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    turns: dict[tuple[str, int], TeacherForcingTurn] = {}
+    for row in read_jsonl(trace_path):
+        if row.get("error"):
+            raise ValueError(
+                f"Teacher-forcing reference contains an error: {row.get('request_id')}"
+            )
+        key = (str(row["question_id"]), int(row["turn_id"]))
+        if key in turns:
+            raise ValueError(f"Duplicate teacher-forcing reference turn: {key}")
+        output = str(row.get("output") or "")
+        token_ids = list(tokenizer.encode(output, add_special_tokens=False))
+        completion_tokens = int(row.get("completion_tokens") or len(token_ids))
+        if not token_ids:
+            raise ValueError(f"Reference {key} has no output tokens")
+        turns[key] = TeacherForcingTurn(
+            output=output,
+            token_ids=tuple(int(token) for token in token_ids),
+            completion_tokens=completion_tokens,
+        )
+    return turns
+
+
 def run_item(
     item: BenchmarkItem,
     *,
-    server_url: str,
+    item_index: int,
+    server_urls: tuple[str, ...],
     api_key: str,
     model: str,
     temperature: float,
@@ -261,6 +314,7 @@ def run_item(
     max_tokens: int,
     timeout: float,
     extra_body: dict[str, Any],
+    teacher_forcing_turns: dict[tuple[str, int], TeacherForcingTurn],
     stop_on_error: bool,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
@@ -268,21 +322,40 @@ def run_item(
     for turn_id, user_text in enumerate(item.turns):
         conversation.append({"role": "user", "content": user_text})
         request_messages = [dict(message) for message in conversation]
+        teacher_turn = teacher_forcing_turns.get((item.question_id, turn_id))
+        request_extra_body = copy.deepcopy(extra_body)
+        request_max_tokens = max_tokens
+        if teacher_turn is not None:
+            request_max_tokens = len(teacher_turn.token_ids)
+            request_extra_body["ignore_eos"] = True
+            request_extra_body["min_tokens"] = request_max_tokens
+            custom_params = request_extra_body.setdefault("custom_params", {})
+            if not isinstance(custom_params, dict):
+                raise ValueError("extra_body.custom_params must be a JSON object")
+            custom_params["ngram_teacher_forcing_token_ids"] = list(
+                teacher_turn.token_ids
+            )
+            custom_params["ngram_teacher_forcing_record_id"] = (
+                f"{item.benchmark}:{item.question_id}:turn{turn_id}"
+            )
+        request_server_url = server_urls[(item_index + turn_id) % len(server_urls)]
         response, latency_s, error = call_chat_completion(
-            server_url=server_url,
+            server_url=request_server_url,
             api_key=api_key,
             model=model,
             messages=request_messages,
             temperature=temperature,
             top_p=top_p,
             seed=seed,
-            max_tokens=max_tokens,
+            max_tokens=request_max_tokens,
             timeout=timeout,
-            extra_body=extra_body,
+            extra_body=request_extra_body,
         )
         output = extract_output(response)
+        meta_info = response_meta_info(response)
         record = {
             "request_id": f"{item.benchmark}:{item.question_id}:turn{turn_id}",
+            "server_url": request_server_url,
             "benchmark": item.benchmark,
             "question_id": item.question_id,
             "turn_id": turn_id,
@@ -299,6 +372,20 @@ def run_item(
             "top_p": top_p,
             "seed": seed,
             "max_tokens": max_tokens,
+            "request_max_tokens": request_max_tokens,
+            "teacher_forcing": teacher_turn is not None,
+            "teacher_forcing_match": (
+                output == teacher_turn.output if teacher_turn is not None else None
+            ),
+            "teacher_forcing_reference_completion_tokens": (
+                teacher_turn.completion_tokens if teacher_turn is not None else None
+            ),
+            "spec_accept_rate": meta_info.get("spec_accept_rate"),
+            "spec_accept_length": meta_info.get("spec_accept_length"),
+            "spec_num_correct_drafts": meta_info.get("spec_num_correct_drafts"),
+            "spec_num_proposed_drafts": meta_info.get("spec_num_proposed_drafts"),
+            "spec_verify_ct": meta_info.get("spec_verify_ct"),
+            "meta_info": meta_info,
         }
         records.append(record)
         if error and stop_on_error:
@@ -334,6 +421,17 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         value = ordered[lower] * (1 - weight) + ordered[upper] * weight
         return round(value, 6)
 
+    forced = [row for row in records if row.get("teacher_forcing")]
+    teacher_mismatches = sum(
+        1 for row in forced if row.get("teacher_forcing_match") is not True
+    )
+    verify_ct = sum(int(row.get("spec_verify_ct") or 0) for row in records)
+    correct_drafts = sum(
+        int(row.get("spec_num_correct_drafts") or 0) for row in records
+    )
+    proposed_drafts = sum(
+        int(row.get("spec_num_proposed_drafts") or 0) for row in records
+    )
     return {
         "turns": len(records),
         "errors": errors,
@@ -346,7 +444,19 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "latency_max_s": round(max(latencies), 6) if latencies else None,
         "latency_p50_s": percentile(latencies, 0.50),
         "latency_p90_s": percentile(latencies, 0.90),
+        "latency_p95_s": percentile(latencies, 0.95),
         "latency_p99_s": percentile(latencies, 0.99),
+        "teacher_forced_turns": len(forced),
+        "teacher_forcing_mismatches": teacher_mismatches,
+        "spec_verify_ct": verify_ct,
+        "spec_num_correct_drafts": correct_drafts,
+        "spec_num_proposed_drafts": proposed_drafts,
+        "spec_accept_rate_weighted": (
+            round(correct_drafts / proposed_drafts, 8) if proposed_drafts else None
+        ),
+        "spec_accept_length_weighted": (
+            round(completion_tokens / verify_ct, 8) if verify_ct else None
+        ),
     }
 
 
@@ -386,6 +496,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--server_url",
         default="http://127.0.0.1:1919/v1",
     )
+    parser.add_argument(
+        "--server-urls",
+        nargs="+",
+        default=None,
+        help="Optional worker URLs used with client-side round-robin routing.",
+    )
     parser.add_argument("--model", "--model-name", "--model_name", required=True)
     parser.add_argument("--api-key", default="dummy")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -421,6 +537,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Continue later turns of the same question after an error.",
     )
+    parser.add_argument(
+        "--teacher-forcing-trace",
+        type=Path,
+        default=None,
+        help="Reference turn_traces.jsonl whose outputs are forced token-for-token.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Local tokenizer path used to encode a teacher-forcing trace.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument(
         "--print-every",
@@ -449,6 +576,26 @@ def main() -> int:
     if not items:
         raise SystemExit("No benchmark items selected.")
 
+    teacher_forcing_turns: dict[tuple[str, int], TeacherForcingTurn] = {}
+    if args.teacher_forcing_trace:
+        if not args.tokenizer:
+            raise SystemExit("--tokenizer is required with --teacher-forcing-trace")
+        teacher_forcing_turns = load_teacher_forcing_turns(
+            args.teacher_forcing_trace.expanduser().resolve(),
+            tokenizer_path=args.tokenizer,
+        )
+        expected_keys = {
+            (item.question_id, turn_id)
+            for item in items
+            for turn_id in range(len(item.turns))
+        }
+        missing = sorted(expected_keys - teacher_forcing_turns.keys())
+        if missing:
+            raise SystemExit(
+                f"Teacher-forcing trace is missing {len(missing)} selected turns; "
+                f"first missing={missing[0]}"
+            )
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (
         args.output_dir.expanduser().resolve()
@@ -464,6 +611,8 @@ def main() -> int:
     print(f"benchmark: {args.benchmark}")
     print(f"items: {len(items)}")
     print(f"server_url: {args.server_url}")
+    if args.server_urls:
+        print(f"server_urls: {args.server_urls}")
     print(f"model: {args.model}")
     print(f"temperature: {args.temperature}")
     print(f"top_p: {args.top_p}")
@@ -471,8 +620,10 @@ def main() -> int:
     print(f"max_tokens: {args.max_tokens}")
     print(f"concurrency: {args.concurrency}")
     print(f"trace_output: {trace_path}")
+    print(f"teacher_forced_turns: {len(teacher_forcing_turns)}")
 
     lock = threading.Lock()
+    server_urls = tuple(args.server_urls or [args.server_url])
     all_records: list[dict[str, Any]] = []
     start = time.perf_counter()
     completed = 0
@@ -482,7 +633,8 @@ def main() -> int:
             pool.submit(
                 run_item,
                 item,
-                server_url=args.server_url,
+                item_index=item_index,
+                server_urls=server_urls,
                 api_key=args.api_key,
                 model=args.model,
                 temperature=args.temperature,
@@ -491,9 +643,10 @@ def main() -> int:
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
                 extra_body=args.extra_body,
+                teacher_forcing_turns=teacher_forcing_turns,
                 stop_on_error=not args.keep_going_after_error,
             ): item
-            for item in items
+            for item_index, item in enumerate(items)
         }
         for future in concurrent.futures.as_completed(future_to_item):
             item = future_to_item[future]
@@ -540,6 +693,7 @@ def main() -> int:
         "benchmark": args.benchmark,
         "benchmark_root": str(benchmark_root),
         "server_url": args.server_url,
+        "server_urls": args.server_urls,
         "model": args.model,
         "temperature": args.temperature,
         "top_p": args.top_p,
@@ -552,6 +706,11 @@ def main() -> int:
         if wall_time_s > 0
         else None,
         "trace_output": str(trace_path),
+        "teacher_forcing_trace": (
+            str(args.teacher_forcing_trace.expanduser().resolve())
+            if args.teacher_forcing_trace
+            else None
+        ),
         **summarize(all_records),
     }
     if summary["completion_tokens"]:
