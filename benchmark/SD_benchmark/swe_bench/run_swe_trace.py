@@ -231,6 +231,7 @@ def call_chat_completion(
     extra_body: dict[str, Any],
     tools: list[dict[str, Any]] | None,
     tool_choice: str | None,
+    collect_sglang_spec_metrics: bool,
 ) -> tuple[dict[str, Any] | None, float, str | None]:
     payload: dict[str, Any] = {
         "model": model,
@@ -241,19 +242,27 @@ def call_chat_completion(
     }
     if seed is not None:
         payload["seed"] = seed
+    if collect_sglang_spec_metrics:
+        # SGLang extension: returns request-level speculative counters in meta_info.
+        payload["return_meta_info"] = True
     if tools:
         payload["tools"] = tools
         if tool_choice:
             payload["tool_choice"] = tool_choice
     payload.update(extra_body)
     data = json.dumps(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if collect_sglang_spec_metrics:
+        # Lets the multi-instance gateway restore the SGLang-only payload field
+        # after its typed OpenAI request round trip.
+        headers["X-SGLang-Return-Meta-Info"] = "true"
     request = urllib.request.Request(
         endpoint(server_url),
         data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
+        headers=headers,
         method="POST",
     )
     start = time.perf_counter()
@@ -303,6 +312,39 @@ def usage_value(response: dict[str, Any] | None, key: str) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def sglang_spec_metrics(response: dict[str, Any] | None) -> dict[str, int | float | None]:
+    """Extract raw per-request counters when SGLang return_meta_info is enabled."""
+    # SGLang's OpenAI chat response stores meta_info on each choice. Keep the
+    # top-level fallback for compatible non-chat/proxy response formats.
+    choices = (response or {}).get("choices") or []
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    meta_info = first_choice.get("meta_info") or (response or {}).get("meta_info") or {}
+    if not isinstance(meta_info, dict):
+        meta_info = {}
+
+    def as_int(key: str) -> int | None:
+        try:
+            value = meta_info.get(key)
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def as_float(key: str) -> float | None:
+        try:
+            value = meta_info.get(key)
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "spec_verify_ct": as_int("spec_verify_ct"),
+        "spec_num_correct_drafts": as_int("spec_num_correct_drafts"),
+        "spec_num_proposed_drafts": as_int("spec_num_proposed_drafts"),
+        "spec_accept_length": as_float("spec_accept_length"),
+        "spec_accept_rate": as_float("spec_accept_rate"),
+    }
 
 
 def chat_message_from_record(message: dict[str, Any]) -> dict[str, Any]:
@@ -376,6 +418,7 @@ def run_row(
     tool_schema_path: str | None,
     tool_mode: str,
     tool_choice: str | None,
+    collect_sglang_spec_metrics: bool,
 ) -> dict[str, Any]:
     messages, used_recorded_messages, tool_prompt_applied = messages_for_row(
         row, tool_prompt
@@ -393,6 +436,7 @@ def run_row(
         extra_body=extra_body,
         tools=tools,
         tool_choice=tool_choice,
+        collect_sglang_spec_metrics=collect_sglang_spec_metrics,
     )
     output, generated_tool_calls, finish_reason = extract_response_message(response)
     return {
@@ -412,6 +456,7 @@ def run_row(
         "prompt_tokens": usage_value(response, "prompt_tokens"),
         "completion_tokens": usage_value(response, "completion_tokens"),
         "total_tokens": usage_value(response, "total_tokens"),
+        **sglang_spec_metrics(response),
         "latency_s": round(latency_s, 6),
         "error": error,
         "model": model,
@@ -449,6 +494,7 @@ def run_workflow(
     tool_schema_path: str | None,
     tool_mode: str,
     tool_choice: str | None,
+    collect_sglang_spec_metrics: bool,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for row in workflow_rows:
@@ -470,6 +516,7 @@ def run_workflow(
                 tool_schema_path=tool_schema_path,
                 tool_mode=tool_mode,
                 tool_choice=tool_choice,
+                collect_sglang_spec_metrics=collect_sglang_spec_metrics,
             )
         )
     return records
@@ -503,6 +550,20 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in records)
     completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in records)
     errors = sum(1 for row in records if row.get("error"))
+    spec_records = [
+        row
+        for row in records
+        if int(row.get("spec_verify_ct") or 0) > 0
+        and row.get("spec_num_correct_drafts") is not None
+        and row.get("spec_num_proposed_drafts") is not None
+    ]
+    spec_verify_ct = sum(int(row["spec_verify_ct"]) for row in spec_records)
+    spec_correct_drafts = sum(
+        int(row["spec_num_correct_drafts"]) for row in spec_records
+    )
+    spec_proposed_drafts = sum(
+        int(row["spec_num_proposed_drafts"]) for row in spec_records
+    )
     generated_tool_call_turns = 0
     generated_tool_calls_total = 0
     generated_tool_name_match_turns = 0
@@ -525,7 +586,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         }
         if expected_names and expected_names.intersection(generated_names):
             generated_tool_name_match_turns += 1
-    return {
+    summary = {
         "turns": len(records),
         "errors": errors,
         "prompt_tokens": prompt_tokens,
@@ -543,6 +604,27 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "latency_p90_s": percentile(latencies, 0.90),
         "latency_p99_s": percentile(latencies, 0.99),
     }
+    if spec_verify_ct > 0:
+        # These use sums of raw request counters, never a mean of request/worker means.
+        summary.update(
+            {
+                "spec_metric_turns": len(spec_records),
+                "spec_verify_ct": spec_verify_ct,
+                "spec_num_correct_drafts": spec_correct_drafts,
+                "spec_num_proposed_drafts": spec_proposed_drafts,
+                "spec_accept_length": round(
+                    (spec_correct_drafts + spec_verify_ct) / spec_verify_ct, 6
+                ),
+                "spec_draft_accept_length": round(
+                    spec_correct_drafts / spec_verify_ct, 6
+                ),
+                "spec_accept_rate": round(
+                    spec_correct_drafts / spec_proposed_drafts, 6)
+                if spec_proposed_drafts > 0
+                else None,
+            }
+        )
+    return summary
 
 
 def parse_extra_body(raw: str) -> dict[str, Any]:
@@ -625,6 +707,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Plain-text tool instructions used only when --tool-mode=plain.",
     )
     parser.add_argument("--extra-body", type=parse_extra_body, default={})
+    parser.add_argument(
+        "--collect-sglang-spec-metrics",
+        action="store_true",
+        help=(
+            "Request SGLang return_meta_info and aggregate raw per-request "
+            "speculative counters in the JSONL and summary."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--print-every", type=int, default=20)
     parser.add_argument(
@@ -763,6 +853,7 @@ def main() -> int:
                 tool_schema_path=str(tool_schema_path) if tool_schema_path else None,
                 tool_mode=args.tool_mode,
                 tool_choice=tool_choice,
+                collect_sglang_spec_metrics=args.collect_sglang_spec_metrics,
             ): workflow_rows
             for workflow_rows in workflows
         }

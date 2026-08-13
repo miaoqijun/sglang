@@ -12,6 +12,9 @@ workload comparison, not official benchmark scoring.
   coding, math, summarization, translation, RAG, and related tasks.
 - `swe_bench/`: trace-replay workload built from mini-swe-agent SWE-bench
   coding trajectories.
+- `agentsociety/`: portable causal replay workload derived from an
+  AgentSociety simulation record. It includes its raw LLM-call record and does
+  not require an AgentSociety installation.
 
 The runner records full request/response traces so speculative decoding
 behavior can be analyzed later.
@@ -30,21 +33,27 @@ Each JSONL trace row contains:
 - request parameters such as model, temperature, top-p, seed, and max tokens
 
 For batch runs, `batch_results.csv` summarizes throughput, latency percentiles,
-token counts, GPU utilization/memory, paths to per-run logs, and
-`accept_len_mean` when the local SGLang build exposes it through
-`/server_info`. This accepted-length field follows the SPEED-Bench-style
-convention: average output tokens advanced per decode/verify step, including
-the normal target token. For speculative runs, the batch output also includes
-true speculative counters from SGLang's `SpecMetrics`, such as
-`spec_true_mean_accept_len`, `spec_true_accept_rate`, and
-`spec_zero_accept_ratio`. These fields are not derived from per-batch log
-averages. The batch runner also writes
-`perf_summary.csv/json` with baseline-relative wall-time and throughput
-speedups.
+token counts, GPU utilization/memory, and paths to per-run logs. For an NGRAM
+run, the authoritative speculative metrics are aggregated from raw counters
+returned for each request: `spec_verify_ct`, `spec_num_correct_drafts`, and
+`spec_num_proposed_drafts`. The resulting `spec_accept_length` includes the
+normal target/bonus token, while `spec_draft_accept_length` counts only
+accepted draft tokens; `spec_accept_rate` is accepted draft tokens divided by
+proposed draft tokens. These are global ratios of summed raw counters, never
+means of worker or decode-batch averages. The single-instance batch runner
+also writes `perf_summary.csv/json` with baseline-relative wall-time and
+throughput speedups.
 
 ## Scripts
 
 `run_benchmark.py` runs one benchmark against an OpenAI-compatible chat server.
+It also supports SGLang's teacher-forced trace replay: pass a prior successful
+`turn_traces.jsonl` with `--teacher-forcing-trace` and the matching local
+`--tokenizer`. The runner encodes each recorded output and sends it as
+`custom_params.ngram_teacher_forcing_token_ids`; this requires the corresponding
+teacher-forcing support in the SGLang checkout. `--server-urls URL0 URL1 ...`
+is an optional client-side round-robin mode for directly addressing workers.
+Normal benchmark runs are unchanged unless `--teacher-forcing-trace` is given.
 
 `run_benchmark_batch.sh` starts SGLang, runs one or more benchmarks
 sequentially, and restarts the server for each benchmark / variant /
@@ -53,6 +62,44 @@ concurrency setting.
 `backfill_spec_metrics.py` can recover accepted-length and speculative counter
 columns for existing batch results when the run directories already contain
 `server_info.json` captured from `/server_info`.
+
+## Multi-Instance Gateway Runs
+
+`run_multi_instance_benchmark_batch.sh` starts two SGLang workers, a
+round-robin `sglang_router`, and an optional shared NGRAM L2 history store.
+Use an NGRAM variant ending in `_no_l2` to disable only cross-instance history.
+Set `GPU_IDS="0 1"` to place the two workers on different GPUs. The older
+`GPU_ID=0` form remains supported and defaults to `GPU_IDS="0 0"`. The
+per-run `gpu.csv` samples each distinct selected GPU and `batch_results.csv`
+records the worker GPU pair.
+The portable AgentSociety counterpart is
+`agentsociety/run_agentsociety_multi_instance_batch.sh`; it preserves the
+recorded AgentSociety call dependencies while using the same worker/router/L2
+deployment pattern.
+
+The router's typed OpenAI request model otherwise drops SGLang's
+`return_meta_info` extension. Apply the bundled patch once in the coauthor's
+SGLang checkout and rebuild the Python gateway binding before collecting
+accepted-length metrics:
+
+```bash
+cd /path/to/sglang
+
+git apply --check --directory=sgl-model-gateway \
+  /path/to/AgentSociety/SD_benchmark/patches/sgl_model_gateway_return_meta_info.patch
+git apply --directory=sgl-model-gateway \
+  /path/to/AgentSociety/SD_benchmark/patches/sgl_model_gateway_return_meta_info.patch
+
+cd sgl-model-gateway/bindings/python
+RUSTUP_TOOLCHAIN=stable maturin develop --features vendored-openssl
+```
+
+The benchmark runner sends the opt-in header only for NGRAM variants; the
+patched router converts it to `return_meta_info: true` before forwarding to a
+worker. A correct run has non-empty `spec_metric_turns`, `spec_verify_ct`,
+`spec_accept_length`, and `spec_accept_rate` in both `summary.json` and
+`batch_results.csv`. Do not use the older `accept_len_mean` or `/server_info`
+fields for multi-instance comparisons.
 
 ## Mini-SWE-Agent Trace Replay
 
