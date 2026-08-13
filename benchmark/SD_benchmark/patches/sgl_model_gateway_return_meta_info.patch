@@ -1,0 +1,63 @@
+diff --git a/src/routers/http/router.rs b/src/routers/http/router.rs
+index 029c9d1..bddbdf6 100644
+--- a/src/routers/http/router.rs
++++ b/src/routers/http/router.rs
+@@ -498,17 +498,33 @@ impl Router {
+ 
+         // Static key string to avoid per-request allocations
+         const DP_RANK_KEY: &str = "data_parallel_rank";
+-
+-        let mut request_builder = if self.dp_aware {
+-            let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
+-                Ok(tup) => tup,
+-                Err(e) => {
+-                    error!("Failed to extract dp_rank: {}", e);
+-                    return error::internal_error(
+-                        "dp_rank_extraction_failed",
+-                        format!("Failed to extract dp_rank: {}", e),
+-                    );
++        const RETURN_META_INFO_KEY: &str = "return_meta_info";
++        const RETURN_META_INFO_HEADER: &str = "x-sglang-return-meta-info";
++
++        // ChatCompletionRequest is a typed OpenAI request, so unmodelled
++        // SGLang fields are dropped by its deserialize/serialize round trip.
++        // Restore this opt-in field from a gateway-specific header.
++        let request_meta_info = route == "/v1/chat/completions"
++            && headers
++                .and_then(|header_map| header_map.get(RETURN_META_INFO_HEADER))
++                .and_then(|value| value.to_str().ok())
++                .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
++                .unwrap_or(false);
++
++        let mut request_builder = if self.dp_aware || request_meta_info {
++            let (worker_url_prefix, dp_rank) = if self.dp_aware {
++                match Self::extract_dp_rank(worker_url) {
++                    Ok(tup) => tup,
++                    Err(e) => {
++                        error!("Failed to extract dp_rank: {}", e);
++                        return error::internal_error(
++                            "dp_rank_extraction_failed",
++                            format!("Failed to extract dp_rank: {}", e),
++                        );
++                    }
+                 }
++            } else {
++                (worker_url, 0)
+             };
+ 
+             let mut json_val = match serde_json::to_value(typed_req) {
+@@ -522,8 +538,12 @@ impl Router {
+             };
+ 
+             if let Some(map) = json_val.as_object_mut() {
+-                // Use static key string to avoid allocation
+-                map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
++                if self.dp_aware {
++                    map.insert(DP_RANK_KEY.to_string(), serde_json::json!(dp_rank));
++                }
++                if request_meta_info {
++                    map.insert(RETURN_META_INFO_KEY.to_string(), serde_json::json!(true));
++                }
+                 // Only serialize if debug logging is enabled to avoid CPU overhead
+                 if tracing::enabled!(tracing::Level::DEBUG) {
+                     debug!(

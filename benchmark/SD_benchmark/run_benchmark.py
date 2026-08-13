@@ -52,6 +52,8 @@ class BenchmarkItem:
 
 @dataclass(frozen=True)
 class TeacherForcingTurn:
+    """A recorded target continuation supplied to the NGRAM teacher-forcing path."""
+
     output: str
     token_ids: tuple[int, ...]
     completion_tokens: int
@@ -189,6 +191,7 @@ def call_chat_completion(
     max_tokens: int,
     timeout: float,
     extra_body: dict[str, Any],
+    collect_sglang_spec_metrics: bool,
 ) -> tuple[dict[str, Any] | None, float, str | None]:
     payload: dict[str, Any] = {
         "model": model,
@@ -199,12 +202,19 @@ def call_chat_completion(
     }
     if seed is not None:
         payload["seed"] = seed
+    if collect_sglang_spec_metrics:
+        # SGLang extension: returns request-level speculative counters in meta_info.
+        payload["return_meta_info"] = True
     payload.update(extra_body)
     data = json.dumps(payload).encode("utf-8")
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
+    if collect_sglang_spec_metrics:
+        # Lets the multi-instance gateway restore the SGLang-only payload field
+        # after its typed OpenAI request round trip.
+        headers["X-SGLang-Return-Meta-Info"] = "true"
     request = urllib.request.Request(
         endpoint(server_url),
         data=data,
@@ -257,13 +267,44 @@ def usage_value(response: dict[str, Any] | None, key: str) -> int | None:
         return None
 
 
+def sglang_spec_metrics(response: dict[str, Any] | None) -> dict[str, int | float | None]:
+    """Extract raw per-request counters when SGLang return_meta_info is enabled."""
+    # SGLang's OpenAI chat response stores meta_info on each choice. Keep the
+    # top-level fallback for compatible non-chat/proxy response formats.
+    choices = (response or {}).get("choices") or []
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    meta_info = first_choice.get("meta_info") or (response or {}).get("meta_info") or {}
+    if not isinstance(meta_info, dict):
+        meta_info = {}
+
+    def as_int(key: str) -> int | None:
+        try:
+            value = meta_info.get(key)
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def as_float(key: str) -> float | None:
+        try:
+            value = meta_info.get(key)
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "spec_verify_ct": as_int("spec_verify_ct"),
+        "spec_num_correct_drafts": as_int("spec_num_correct_drafts"),
+        "spec_num_proposed_drafts": as_int("spec_num_proposed_drafts"),
+        "spec_accept_length": as_float("spec_accept_length"),
+        "spec_accept_rate": as_float("spec_accept_rate"),
+    }
+
+
 def response_meta_info(response: dict[str, Any] | None) -> dict[str, Any]:
-    if not response:
-        return {}
-    choices = response.get("choices") or []
-    if not choices or not isinstance(choices[0], dict):
-        return {}
-    value = choices[0].get("meta_info")
+    """Return SGLang metadata without requiring it for ordinary servers."""
+    choices = (response or {}).get("choices") or []
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+    value = first_choice.get("meta_info") or (response or {}).get("meta_info")
     return value if isinstance(value, dict) else {}
 
 
@@ -272,6 +313,7 @@ def load_teacher_forcing_turns(
     *,
     tokenizer_path: str,
 ) -> dict[tuple[str, int], TeacherForcingTurn]:
+    """Load prior benchmark outputs and encode them for SGLang teacher forcing."""
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -289,14 +331,13 @@ def load_teacher_forcing_turns(
         if key in turns:
             raise ValueError(f"Duplicate teacher-forcing reference turn: {key}")
         output = str(row.get("output") or "")
-        token_ids = list(tokenizer.encode(output, add_special_tokens=False))
-        completion_tokens = int(row.get("completion_tokens") or len(token_ids))
+        token_ids = tokenizer.encode(output, add_special_tokens=False)
         if not token_ids:
             raise ValueError(f"Reference {key} has no output tokens")
         turns[key] = TeacherForcingTurn(
             output=output,
             token_ids=tuple(int(token) for token in token_ids),
-            completion_tokens=completion_tokens,
+            completion_tokens=int(row.get("completion_tokens") or len(token_ids)),
         )
     return turns
 
@@ -314,6 +355,7 @@ def run_item(
     max_tokens: int,
     timeout: float,
     extra_body: dict[str, Any],
+    collect_sglang_spec_metrics: bool,
     teacher_forcing_turns: dict[tuple[str, int], TeacherForcingTurn],
     stop_on_error: bool,
 ) -> list[dict[str, Any]]:
@@ -338,6 +380,7 @@ def run_item(
             custom_params["ngram_teacher_forcing_record_id"] = (
                 f"{item.benchmark}:{item.question_id}:turn{turn_id}"
             )
+
         request_server_url = server_urls[(item_index + turn_id) % len(server_urls)]
         response, latency_s, error = call_chat_completion(
             server_url=request_server_url,
@@ -350,6 +393,7 @@ def run_item(
             max_tokens=request_max_tokens,
             timeout=timeout,
             extra_body=request_extra_body,
+            collect_sglang_spec_metrics=collect_sglang_spec_metrics,
         )
         output = extract_output(response)
         meta_info = response_meta_info(response)
@@ -365,6 +409,7 @@ def run_item(
             "prompt_tokens": usage_value(response, "prompt_tokens"),
             "completion_tokens": usage_value(response, "completion_tokens"),
             "total_tokens": usage_value(response, "total_tokens"),
+            **sglang_spec_metrics(response),
             "latency_s": round(latency_s, 6),
             "error": error,
             "model": model,
@@ -380,11 +425,6 @@ def run_item(
             "teacher_forcing_reference_completion_tokens": (
                 teacher_turn.completion_tokens if teacher_turn is not None else None
             ),
-            "spec_accept_rate": meta_info.get("spec_accept_rate"),
-            "spec_accept_length": meta_info.get("spec_accept_length"),
-            "spec_num_correct_drafts": meta_info.get("spec_num_correct_drafts"),
-            "spec_num_proposed_drafts": meta_info.get("spec_num_proposed_drafts"),
-            "spec_verify_ct": meta_info.get("spec_verify_ct"),
             "meta_info": meta_info,
         }
         records.append(record)
@@ -408,6 +448,24 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in records)
     completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in records)
     errors = sum(1 for row in records if row.get("error"))
+    forced = [row for row in records if row.get("teacher_forcing")]
+    teacher_mismatches = sum(
+        1 for row in forced if row.get("teacher_forcing_match") is not True
+    )
+    spec_records = [
+        row
+        for row in records
+        if int(row.get("spec_verify_ct") or 0) > 0
+        and row.get("spec_num_correct_drafts") is not None
+        and row.get("spec_num_proposed_drafts") is not None
+    ]
+    spec_verify_ct = sum(int(row["spec_verify_ct"]) for row in spec_records)
+    spec_correct_drafts = sum(
+        int(row["spec_num_correct_drafts"]) for row in spec_records
+    )
+    spec_proposed_drafts = sum(
+        int(row["spec_num_proposed_drafts"]) for row in spec_records
+    )
     def percentile(values: list[float], q: float) -> float | None:
         if not values:
             return None
@@ -421,18 +479,7 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         value = ordered[lower] * (1 - weight) + ordered[upper] * weight
         return round(value, 6)
 
-    forced = [row for row in records if row.get("teacher_forcing")]
-    teacher_mismatches = sum(
-        1 for row in forced if row.get("teacher_forcing_match") is not True
-    )
-    verify_ct = sum(int(row.get("spec_verify_ct") or 0) for row in records)
-    correct_drafts = sum(
-        int(row.get("spec_num_correct_drafts") or 0) for row in records
-    )
-    proposed_drafts = sum(
-        int(row.get("spec_num_proposed_drafts") or 0) for row in records
-    )
-    return {
+    summary = {
         "turns": len(records),
         "errors": errors,
         "prompt_tokens": prompt_tokens,
@@ -444,20 +491,31 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
         "latency_max_s": round(max(latencies), 6) if latencies else None,
         "latency_p50_s": percentile(latencies, 0.50),
         "latency_p90_s": percentile(latencies, 0.90),
-        "latency_p95_s": percentile(latencies, 0.95),
         "latency_p99_s": percentile(latencies, 0.99),
         "teacher_forced_turns": len(forced),
         "teacher_forcing_mismatches": teacher_mismatches,
-        "spec_verify_ct": verify_ct,
-        "spec_num_correct_drafts": correct_drafts,
-        "spec_num_proposed_drafts": proposed_drafts,
-        "spec_accept_rate_weighted": (
-            round(correct_drafts / proposed_drafts, 8) if proposed_drafts else None
-        ),
-        "spec_accept_length_weighted": (
-            round(completion_tokens / verify_ct, 8) if verify_ct else None
-        ),
     }
+    if spec_verify_ct > 0:
+        # These use sums of raw request counters, never a mean of request/worker means.
+        summary.update(
+            {
+                "spec_metric_turns": len(spec_records),
+                "spec_verify_ct": spec_verify_ct,
+                "spec_num_correct_drafts": spec_correct_drafts,
+                "spec_num_proposed_drafts": spec_proposed_drafts,
+                "spec_accept_length": round(
+                    (spec_correct_drafts + spec_verify_ct) / spec_verify_ct, 6
+                ),
+                "spec_draft_accept_length": round(
+                    spec_correct_drafts / spec_verify_ct, 6
+                ),
+                "spec_accept_rate": round(
+                    spec_correct_drafts / spec_proposed_drafts, 6)
+                if spec_proposed_drafts > 0
+                else None,
+            }
+        )
+    return summary
 
 
 def parse_extra_body(raw: str) -> dict[str, Any]:
@@ -533,6 +591,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional JSON object merged into every chat completion request.",
     )
     parser.add_argument(
+        "--collect-sglang-spec-metrics",
+        action="store_true",
+        help=(
+            "Request SGLang return_meta_info and aggregate raw per-request "
+            "speculative counters in the JSONL and summary."
+        ),
+    )
+    parser.add_argument(
         "--keep-going-after-error",
         action="store_true",
         help="Continue later turns of the same question after an error.",
@@ -541,12 +607,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--teacher-forcing-trace",
         type=Path,
         default=None,
-        help="Reference turn_traces.jsonl whose outputs are forced token-for-token.",
+        help="Reference turn_traces.jsonl whose output tokens are forced by SGLang.",
     )
     parser.add_argument(
         "--tokenizer",
         default=None,
-        help="Local tokenizer path used to encode a teacher-forcing trace.",
+        help="Local tokenizer path used to encode --teacher-forcing-trace.",
     )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument(
@@ -643,6 +709,7 @@ def main() -> int:
                 max_tokens=args.max_tokens,
                 timeout=args.timeout,
                 extra_body=args.extra_body,
+                collect_sglang_spec_metrics=args.collect_sglang_spec_metrics,
                 teacher_forcing_turns=teacher_forcing_turns,
                 stop_on_error=not args.keep_going_after_error,
             ): item
