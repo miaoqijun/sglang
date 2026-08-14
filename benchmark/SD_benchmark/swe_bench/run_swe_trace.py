@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import json
 import sys
 import threading
@@ -17,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +31,12 @@ DEFAULT_TOOL_PROMPT = (
     SCRIPT_DIR / "tool_definitions" / "openhands_tools_plain_prompt.md"
 )
 DEFAULT_TOOL_SCHEMA = SCRIPT_DIR / "tool_definitions" / "tools_schema.json"
+
+
+@dataclass(frozen=True)
+class TeacherForcingTurn:
+    output: str
+    token_ids: tuple[int, ...]
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -87,6 +95,37 @@ def request_key(row: dict[str, Any]) -> tuple[str, str, str]:
 def load_failure_keys(path: Path) -> set[tuple[str, str, str]]:
     """Load request identities written by --failure-list-output."""
     return {request_key(item) for item in read_jsonl(path)}
+
+
+def load_teacher_forcing_turns(
+    path: Path, *, tokenizer_path: str
+) -> dict[tuple[str, str, str], TeacherForcingTurn]:
+    """Load source outputs and encode them with the serving model tokenizer."""
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    turns: dict[tuple[str, str, str], TeacherForcingTurn] = {}
+    for row in read_jsonl(path):
+        if row.get("error"):
+            raise ValueError(
+                f"Teacher-forcing reference contains an error: {request_key(row)}"
+            )
+        key = request_key(row)
+        if key in turns:
+            raise ValueError(f"Duplicate teacher-forcing reference: {key}")
+        output = str(row.get("output") or "")
+        token_ids = tokenizer.encode(output, add_special_tokens=False)
+        if not token_ids:
+            raise ValueError(f"Teacher-forcing reference has empty output: {key}")
+        turns[key] = TeacherForcingTurn(
+            output=output,
+            token_ids=tuple(int(token) for token in token_ids),
+        )
+    return turns
 
 
 def failure_reasons(record: dict[str, Any]) -> list[str]:
@@ -419,10 +458,29 @@ def run_row(
     tool_mode: str,
     tool_choice: str | None,
     collect_sglang_spec_metrics: bool,
+    teacher_forcing_turns: dict[tuple[str, str, str], TeacherForcingTurn],
 ) -> dict[str, Any]:
     messages, used_recorded_messages, tool_prompt_applied = messages_for_row(
         row, tool_prompt
     )
+    teacher_turn = teacher_forcing_turns.get(request_key(row))
+    request_extra_body = copy.deepcopy(extra_body)
+    request_max_tokens = max_tokens
+    if teacher_turn is not None:
+        request_max_tokens = len(teacher_turn.token_ids)
+        request_extra_body["ignore_eos"] = True
+        request_extra_body["min_tokens"] = request_max_tokens
+        custom_params = request_extra_body.setdefault("custom_params", {})
+        if not isinstance(custom_params, dict):
+            raise ValueError("extra_body.custom_params must be a JSON object")
+        custom_params["ngram_teacher_forcing_token_ids"] = list(
+            teacher_turn.token_ids
+        )
+        custom_params["ngram_teacher_forcing_record_id"] = (
+            f"swe_bench:{row.get('workflow_id')}:"
+            f"step{row.get('step_id')}:call{row.get('call_id')}"
+        )
+
     response, latency_s, error = call_chat_completion(
         server_url=server_url,
         api_key=api_key,
@@ -431,9 +489,9 @@ def run_row(
         temperature=temperature,
         top_p=top_p,
         seed=seed,
-        max_tokens=max_tokens,
+        max_tokens=request_max_tokens,
         timeout=timeout,
-        extra_body=extra_body,
+        extra_body=request_extra_body,
         tools=tools,
         tool_choice=tool_choice,
         collect_sglang_spec_metrics=collect_sglang_spec_metrics,
@@ -464,6 +522,11 @@ def run_row(
         "top_p": top_p,
         "seed": seed,
         "max_tokens": max_tokens,
+        "request_max_tokens": request_max_tokens,
+        "teacher_forcing": teacher_turn is not None,
+        "teacher_forcing_match": (
+            output == teacher_turn.output if teacher_turn is not None else None
+        ),
         "source_prompt_char_length": row.get("prompt_char_length"),
         "source_output_char_length": row.get("output_char_length"),
         "source_has_tool_call": row.get("has_tool_call"),
@@ -495,6 +558,7 @@ def run_workflow(
     tool_mode: str,
     tool_choice: str | None,
     collect_sglang_spec_metrics: bool,
+    teacher_forcing_turns: dict[tuple[str, str, str], TeacherForcingTurn],
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for row in workflow_rows:
@@ -517,6 +581,7 @@ def run_workflow(
                 tool_mode=tool_mode,
                 tool_choice=tool_choice,
                 collect_sglang_spec_metrics=collect_sglang_spec_metrics,
+                teacher_forcing_turns=teacher_forcing_turns,
             )
         )
     return records
@@ -550,6 +615,10 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     prompt_tokens = sum(int(row.get("prompt_tokens") or 0) for row in records)
     completion_tokens = sum(int(row.get("completion_tokens") or 0) for row in records)
     errors = sum(1 for row in records if row.get("error"))
+    forced = [row for row in records if row.get("teacher_forcing")]
+    teacher_mismatches = sum(
+        1 for row in forced if row.get("teacher_forcing_match") is not True
+    )
     spec_records = [
         row
         for row in records
@@ -589,6 +658,8 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
     summary = {
         "turns": len(records),
         "errors": errors,
+        "teacher_forced_turns": len(forced),
+        "teacher_forcing_mismatches": teacher_mismatches,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
@@ -715,6 +786,17 @@ def build_parser() -> argparse.ArgumentParser:
             "speculative counters in the JSONL and summary."
         ),
     )
+    parser.add_argument(
+        "--teacher-forcing-trace",
+        type=Path,
+        default=None,
+        help="Reference JSONL generated by build_teacher_forcing_trace.py.",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help="Local serving-model tokenizer path required for teacher forcing.",
+    )
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--print-every", type=int, default=20)
     parser.add_argument(
@@ -795,6 +877,26 @@ def main() -> int:
         raise SystemExit(f"No rows selected from {trace_path}")
     selected_rows = [row for workflow in workflows for row in workflow]
 
+    teacher_forcing_turns: dict[tuple[str, str, str], TeacherForcingTurn] = {}
+    teacher_forcing_trace: Path | None = None
+    if args.teacher_forcing_trace:
+        if not args.tokenizer:
+            raise SystemExit("--tokenizer is required with --teacher-forcing-trace")
+        teacher_forcing_trace = args.teacher_forcing_trace.expanduser().resolve()
+        teacher_forcing_turns = load_teacher_forcing_turns(
+            teacher_forcing_trace, tokenizer_path=args.tokenizer
+        )
+        missing = [
+            request_key(row)
+            for row in selected_rows
+            if request_key(row) not in teacher_forcing_turns
+        ]
+        if missing:
+            raise SystemExit(
+                f"Teacher-forcing reference is missing {len(missing)} selected calls; "
+                f"first missing={missing[0]}"
+            )
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = (
         args.output_dir.expanduser().resolve()
@@ -826,6 +928,7 @@ def main() -> int:
     print(f"tool_choice: {tool_choice or 'disabled'}")
     print(f"skip_failure_list: {skip_failure_list or 'disabled'}")
     print(f"skipped_failure_calls: {skipped_failure_calls}")
+    print(f"teacher_forced_turns: {len(teacher_forcing_turns)}")
     print(f"trace_output: {out_trace}")
 
     lock = threading.Lock()
@@ -854,6 +957,7 @@ def main() -> int:
                 tool_mode=args.tool_mode,
                 tool_choice=tool_choice,
                 collect_sglang_spec_metrics=args.collect_sglang_spec_metrics,
+                teacher_forcing_turns=teacher_forcing_turns,
             ): workflow_rows
             for workflow_rows in workflows
         }
@@ -918,6 +1022,9 @@ def main() -> int:
         "concurrency": args.concurrency,
         "max_steps_per_workflow": args.max_steps_per_workflow,
         "skip_failure_list": str(skip_failure_list) if skip_failure_list else None,
+        "teacher_forcing_trace": (
+            str(teacher_forcing_trace) if teacher_forcing_trace else None
+        ),
         "skipped_failure_calls": skipped_failure_calls,
         "tool_mode": args.tool_mode,
         "tool_schema_path": str(tool_schema_path) if tool_schema_path else None,
