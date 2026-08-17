@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlsplit
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -468,6 +469,40 @@ def _handle_ngram(server_args: ServerArgs) -> None:
         raise ValueError(
             "Currently ngram speculative decoding does not support dp attention."
         )
+
+
+def _handle_ngram_service(server_args: ServerArgs) -> None:
+    address = server_args.speculative_ngram_service_address
+    if not address:
+        raise ValueError(
+            "--speculative-ngram-service-address is required for NGRAM_SERVICE"
+        )
+    parsed = urlsplit(address)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError(
+            "--speculative-ngram-service-address must be a tcp://host:port URL"
+        ) from exc
+    if (
+        parsed.scheme != "tcp"
+        or not parsed.hostname
+        or port is None
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise ValueError(
+            "--speculative-ngram-service-address must be a tcp://host:port URL"
+        )
+    if server_args.speculative_ngram_service_timeout_s <= 0:
+        raise ValueError("--speculative-ngram-service-timeout-s must be positive")
+    if server_args.speculative_ngram_external_corpus_path is not None:
+        raise ValueError("External corpora are not supported by NGRAM_SERVICE")
+    if server_args.tp_size != 1:
+        raise ValueError("NGRAM_SERVICE currently requires --tp-size 1")
 
 
 def _maybe_disable_adaptive(server_args: ServerArgs) -> None:

@@ -38,6 +38,7 @@ class SpeculativeAlgorithm(Enum):
     FROZEN_KV_MTP = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    NGRAM_SERVICE = auto()
     NONE = auto()
 
     @classmethod
@@ -113,7 +114,10 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.STANDALONE
 
     def is_ngram(self) -> bool:
-        return self == SpeculativeAlgorithm.NGRAM
+        return self in (
+            SpeculativeAlgorithm.NGRAM,
+            SpeculativeAlgorithm.NGRAM_SERVICE,
+        )
 
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash()
@@ -169,6 +173,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_ngram_service,
         )
 
         if self.is_dflash():
@@ -179,6 +184,8 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family(server_args)
         elif self.is_ngram():
             _handle_ngram(server_args)
+            if self == SpeculativeAlgorithm.NGRAM_SERVICE:
+                _handle_ngram_service(server_args)
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -232,6 +239,12 @@ class SpeculativeAlgorithm(Enum):
             )
 
             return StandaloneWorkerV2
+        elif self == SpeculativeAlgorithm.NGRAM_SERVICE:
+            from sglang.srt.speculative.ngram_service_worker import (
+                NGRAMServiceWorker,
+            )
+
+            return NGRAMServiceWorker
         elif self.is_ngram():
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 

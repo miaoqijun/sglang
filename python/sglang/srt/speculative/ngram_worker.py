@@ -121,6 +121,18 @@ def build_ngram_teacher_forcing_targets(
 
 
 class NGRAMWorker(BaseSpecWorker):
+    def _create_ngram_corpus(self, server_args: ServerArgs):
+        return NgramCorpus(
+            min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
+            max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
+            match_type=server_args.speculative_ngram_match_type,
+            capacity=server_args.speculative_ngram_capacity,
+            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
+            draft_token_num=server_args.speculative_num_draft_tokens,
+            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
+            external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
+        )
+
     def alloc_memory_pool(self, **kwargs):
         # The target memory pool does not exist yet when __init__ runs.
         self.req_to_token_pool, self.token_to_kv_pool_allocator = (
@@ -161,16 +173,7 @@ class NGRAMWorker(BaseSpecWorker):
         # requests that left the batch (see forward_batch_generation).
         self._prev_decode_rids: set = set()
 
-        self.ngram_corpus = NgramCorpus(
-            min_bfs_breadth=server_args.speculative_ngram_min_bfs_breadth,
-            max_bfs_breadth=server_args.speculative_ngram_max_bfs_breadth,
-            match_type=server_args.speculative_ngram_match_type,
-            capacity=server_args.speculative_ngram_capacity,
-            max_trie_depth=server_args.speculative_ngram_max_trie_depth,
-            draft_token_num=server_args.speculative_num_draft_tokens,
-            external_sam_budget=server_args.speculative_ngram_external_sam_budget,
-            external_corpus_max_tokens=server_args.speculative_ngram_external_corpus_max_tokens,
-        )
+        self.ngram_corpus = self._create_ngram_corpus(server_args)
         if server_args.speculative_ngram_external_corpus_path is not None:
             from sglang.srt.speculative.cpp_ngram.external_corpus import (
                 iter_external_corpus_chunks,

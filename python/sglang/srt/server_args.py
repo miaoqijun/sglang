@@ -1445,7 +1445,7 @@ class ServerArgs:
     # -------------------------------------------------------------------------
     speculative_algorithm: A[
         Optional[str],
-        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
+        "Speculative algorithm. Builtins: EAGLE, EAGLE3, NEXTN, STANDALONE, NGRAM, NGRAM_SERVICE, DFLASH. Or any name registered via `SpeculativeAlgorithm.register`.",
     ] = None
     speculative_draft_model_path: A[
         Optional[str],
@@ -1587,6 +1587,14 @@ class ServerArgs:
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    speculative_ngram_service_address: A[
+        Optional[str],
+        "TCP address of the standalone NGRAM service, for example tcp://127.0.0.1:31291.",
+    ] = None
+    speculative_ngram_service_timeout_s: A[
+        float,
+        "Socket timeout in seconds for NGRAM_SERVICE requests.",
+    ] = 5.0
 
     # -------------------------------------------------------------------------
     # Expert parallelism
@@ -6846,7 +6854,7 @@ class ServerArgs:
                 )
 
             # Validate compatibility with speculative decoding
-            if self.speculative_algorithm not in ["NGRAM", None]:
+            if self.speculative_algorithm not in ["NGRAM", "NGRAM_SERVICE", None]:
                 raise ValueError(
                     "Currently LoRA is only compatible with NGRAM speculative decoding."
                 )

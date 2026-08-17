@@ -5,6 +5,7 @@ from collections.abc import Iterable, Sequence
 from typing import Dict, List, Tuple
 
 import numpy as np
+import torch
 
 from sglang.jit_kernel.ngram_corpus import get_ngram_corpus_cls
 
@@ -51,6 +52,23 @@ class NgramCorpus:
 
     def batch_put(self, batch_tokens: List[List[int]]):
         self._obj.insert(batch_tokens)
+
+    def batch_put_csr(
+        self,
+        tokens_flat: torch.Tensor,
+        offsets: torch.Tensor,
+        *,
+        wait_for_visibility: bool = False,
+    ) -> None:
+        """Insert an already packed CPU CSR batch without rebuilding Python lists.
+
+        ``wait_for_visibility`` drains the corpus' global insertion queue. It
+        therefore waits for this batch and any other pending batches, not only
+        work submitted by the caller.
+        """
+        self._obj.async_insert(tokens_flat, offsets)  # type: ignore
+        if wait_for_visibility:
+            self._obj.synchronize()  # type: ignore
 
     def synchronize(self):
         self._obj.synchronize()  # type: ignore
@@ -105,6 +123,30 @@ class NgramCorpus:
     ) -> Tuple[np.ndarray, np.ndarray]:
         state_ids = [self._get_state_id(rid) for rid in req_ids]
         return self._obj.match_stateful(state_ids, batch_tokens, total_lens)
+
+    def batch_get_csr_into(
+        self,
+        state_ids: torch.Tensor,
+        tokens_flat: torch.Tensor,
+        offsets: torch.Tensor,
+        total_lens: torch.Tensor,
+        out_tokens: torch.Tensor,
+        out_mask: torch.Tensor,
+    ) -> None:
+        """Match a packed CPU CSR batch into caller-owned output buffers."""
+        self._obj.batch_match_stateful(  # type: ignore
+            state_ids,
+            tokens_flat,
+            offsets,
+            total_lens,
+            out_tokens,
+            out_mask,
+        )
+
+    def erase_match_state_ids(self, state_ids: torch.Tensor) -> None:
+        """Erase native incremental match cursors addressed by numeric ids."""
+        if state_ids.numel():
+            self._obj.erase_match_state(state_ids)  # type: ignore
 
     def erase_match_state(self, req_ids: List[str]):
         state_ids = []
