@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 from urllib.parse import urlsplit
 
@@ -57,9 +58,10 @@ def _parse_address(address: str) -> tuple[str, int]:
 class NgramServiceClient:
     """Expose the local ``NgramCorpus`` hot-path API over a TCP connection.
 
-    Normal ``batch_put`` calls wait for visibility, so the inherited
-    ``NGRAMWorker`` can keep its existing pre-match ``synchronize`` call as a
-    no-op without adding a fourth RPC operation.
+    By default ``batch_put`` waits for visibility. Analysis runs can set
+    ``SGLANG_NGRAM_SERVICE_WAIT_FOR_VISIBILITY=0`` to use asynchronous one-way
+    enqueue semantics, where the next ``batch_get`` may observe stale corpus
+    state and put failures are reported by a later acknowledged request.
     """
 
     def __init__(
@@ -76,6 +78,14 @@ class NgramServiceClient:
         self._socket: socket.socket | None = None
         self._next_state_id = 0
         self._req_to_state: dict[str, int] = {}
+        wait_value = os.environ.get(
+            "SGLANG_NGRAM_SERVICE_WAIT_FOR_VISIBILITY", "1"
+        ).strip().lower()
+        if wait_value not in ("0", "1", "false", "true"):
+            raise ValueError(
+                "SGLANG_NGRAM_SERVICE_WAIT_FOR_VISIBILITY must be 0/1/false/true"
+            )
+        self._default_wait_for_visibility = wait_value in ("1", "true")
         self._connect()
 
     def _connect(self) -> None:
@@ -101,6 +111,11 @@ class NgramServiceClient:
             )
         return payload
 
+    def _send_oneway(self, opcode: int, buffers=()) -> None:
+        if self._socket is None:
+            raise RuntimeError("NGRAM service client is closed")
+        send_frame(self._socket, opcode, buffers)
+
     def _state_ids(self, req_ids: list[str]) -> np.ndarray:
         state_ids = np.empty(len(req_ids), dtype=np.int64)
         for index, req_id in enumerate(req_ids):
@@ -118,27 +133,30 @@ class NgramServiceClient:
         self,
         batch_tokens: list[list[int]],
         *,
-        wait_for_visibility: bool = True,
+        wait_for_visibility: bool | None = None,
     ) -> None:
+        if wait_for_visibility is None:
+            wait_for_visibility = self._default_wait_for_visibility
         tokens, offsets = _pack_csr(batch_tokens)
-        payload = self._request(
-            OP_BATCH_PUT,
-            (
-                BATCH_PUT_HEADER.pack(
-                    len(batch_tokens), tokens.size, int(wait_for_visibility)
-                ),
-                offsets,
-                tokens,
+        buffers = (
+            BATCH_PUT_HEADER.pack(
+                len(batch_tokens), tokens.size, int(wait_for_visibility)
             ),
+            offsets,
+            tokens,
         )
-        if len(payload) != COUNT_RESPONSE.size:
-            raise ProtocolError("invalid batch_put response")
-        (accepted,) = COUNT_RESPONSE.unpack(payload)
-        if accepted != len(batch_tokens):
-            raise ProtocolError("batch_put response has an invalid accepted count")
+        if wait_for_visibility:
+            payload = self._request(OP_BATCH_PUT, buffers)
+            if len(payload) != COUNT_RESPONSE.size:
+                raise ProtocolError("invalid batch_put response")
+            (accepted,) = COUNT_RESPONSE.unpack(payload)
+            if accepted != len(batch_tokens):
+                raise ProtocolError("batch_put response has an invalid accepted count")
+        else:
+            self._send_oneway(OP_BATCH_PUT, buffers)
 
     def synchronize(self) -> None:
-        # The worker's normal batch_put() call waits for visibility already.
+        # Visibility is controlled by batch_put; no fourth RPC is used.
         return
 
     def batch_get(

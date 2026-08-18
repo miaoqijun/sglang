@@ -171,11 +171,12 @@ class NgramServiceHandler(socketserver.BaseRequestHandler):
             offsets,
             wait_for_visibility=bool(wait_for_visibility),
         )
-        send_frame(
-            self.request,
-            OP_BATCH_PUT | OP_RESPONSE_BIT,
-            (COUNT_RESPONSE.pack(batch_size),),
-        )
+        if wait_for_visibility:
+            send_frame(
+                self.request,
+                OP_BATCH_PUT | OP_RESPONSE_BIT,
+                (COUNT_RESPONSE.pack(batch_size),),
+            )
 
     def _batch_get(self, payload: bytearray) -> None:
         if len(payload) < BATCH_HEADER.size:

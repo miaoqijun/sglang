@@ -344,12 +344,16 @@ async fn dispatch(
             let tokens = parse_i32s(payload, tokens_offset, token_count)?;
             validate_offsets(&offsets, token_count)?;
             corpus.batch_put(&tokens, &offsets, wait != 0)?;
-            write_frame(
-                stream,
-                opcode | OP_RESPONSE_BIT,
-                &(batch_size as u64).to_le_bytes(),
-            )
-            .await
+            if wait != 0 {
+                write_frame(
+                    stream,
+                    opcode | OP_RESPONSE_BIT,
+                    &(batch_size as u64).to_le_bytes(),
+                )
+                .await
+            } else {
+                Ok(())
+            }
         }
         OP_BATCH_GET => {
             if payload.len() < 8 {
