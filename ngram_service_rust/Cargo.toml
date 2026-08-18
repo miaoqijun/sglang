@@ -1,0 +1,12 @@
+[package]
+name = "ngram-service-rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
