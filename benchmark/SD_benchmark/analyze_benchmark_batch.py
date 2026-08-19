@@ -92,11 +92,20 @@ def summarize(rows: list[dict[str, str]], *, baseline_variant: str) -> list[dict
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("batch_results", type=Path)
-    parser.add_argument("--baseline-variant", default="baseline")
-    parser.add_argument("--csv-output", type=Path, default=None)
-    parser.add_argument("--json-output", type=Path, default=None)
+    parser = argparse.ArgumentParser(
+        description="Compute baseline-relative wall-time and throughput speedups from batch_results.csv.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python SD_benchmark/analyze_benchmark_batch.py "
+            "SD_benchmark/outputs/benchmark_sglang_batch/<run>/batch_results.csv\n\n"
+            "Writes perf_summary.csv and perf_summary.json next to the input by default."
+        ),
+    )
+    parser.add_argument("batch_results", type=Path, help="Batch CSV produced by a launcher.")
+    parser.add_argument("--baseline-variant", default="baseline", help="Variant used as the speedup denominator.")
+    parser.add_argument("--csv-output", type=Path, default=None, help="Optional perf-summary CSV path.")
+    parser.add_argument("--json-output", type=Path, default=None, help="Optional perf-summary JSON path.")
     args = parser.parse_args()
 
     batch_results = args.batch_results.expanduser().resolve()

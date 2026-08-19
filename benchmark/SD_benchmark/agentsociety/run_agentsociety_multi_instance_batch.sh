@@ -9,6 +9,40 @@ set -euo pipefail
 # SD_benchmark/patches/sgl_model_gateway_return_meta_info.patch when raw
 # speculative counters are needed through the router.
 
+usage() {
+  cat <<'EOF'
+Usage:
+  MODEL_PATH=/path/to/model VARIANTS="baseline ngram_d8 ngram_d8_no_l2" \
+  CONCURRENCIES="1 4 16" GPU_IDS="0 1" \
+  bash SD_benchmark/agentsociety/run_agentsociety_multi_instance_batch.sh
+
+Starts two SGLang workers and a round-robin gateway for portable AgentSociety
+record replay. Every point receives fresh workers, router, L2 directory, and
+L2 namespace.
+
+Key environment variables:
+  RECORD_PATH        AgentSociety raw record JSONL. A portable default is bundled.
+  VARIANTS           baseline, ngram_d<N>, ngram_prob_d<N>; append _no_l2 to
+                     disable only shared cross-instance history.
+  CONCURRENCIES      Replay concurrency values. Default: "1 4 16 32".
+  GPU_IDS            Exactly two worker GPU IDs, e.g. "0 1"; "0 0" is smoke-test only.
+  MODEL_PATH         Target model path.
+  L2_ENABLED         Set 0 to disable shared L2 for all NGRAM variants.
+  REPLAY_MODE        faithful (default) or aggressive scheduling.
+  BATCH_ROOT         Parent output directory. Default: SD_benchmark/outputs/agentsociety.
+
+Apply patches/sgl_model_gateway_return_meta_info.patch and rebuild the gateway
+binding before relying on accepted-length metrics through the router.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SGLANG_BIN="${SGLANG_BIN:-sglang}"

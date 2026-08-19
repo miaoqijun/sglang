@@ -15,6 +15,38 @@ set -euo pipefail
 # Run this script from an activated SGLang environment. It deliberately does
 # not use the single-instance run_benchmark_batch.sh launcher.
 
+usage() {
+  cat <<'EOF'
+Usage:
+  MODEL_PATH=/path/to/model BENCHMARKS="mt_bench" \
+  VARIANTS="baseline ngram_d8 ngram_d8_no_l2" CONCURRENCIES="1 4 16" \
+  GPU_IDS="0 1" bash SD_benchmark/run_multi_instance_benchmark_batch.sh
+
+Starts two SGLang workers and a round-robin sglang_router for each experiment
+point. Workers and the gateway are restarted for every point.
+
+Key environment variables:
+  BENCHMARKS       HumanEval, mt_bench, spec_bench, or swe_bench.
+  VARIANTS         baseline, ngram_d<N>, or ngram_prob_d<N>. Add _no_l2 to
+                   disable only shared cross-instance NGRAM history.
+  CONCURRENCIES    Client concurrency values. Default: "1 4".
+  GPU_IDS          Exactly two GPU IDs, e.g. "0 1". "0 0" is smoke-test only.
+  MODEL_PATH       Target model path.
+  WORKER_MEM_FRACTION_STATIC / WORKER_MAX_TOTAL_TOKENS  Worker memory settings.
+  BATCH_ROOT       Parent output directory.
+
+The modified gateway must include patches/sgl_model_gateway_return_meta_info.patch
+to report raw SGLang speculative counters. Results are written to BATCH_ROOT.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
 AS_DIR="${AS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 SGLANG_BIN="${SGLANG_BIN:-sglang}"
@@ -193,6 +225,8 @@ parse_variant() {
   fi
 
   if [[ "$variant" == *_no_l2 ]]; then
+    # _no_l2 disables cross-worker reuse only; each worker still maintains its
+    # ordinary in-process NGRAM cache for the duration of this point.
     variant="${variant%_no_l2}"
   else
     USE_L2=1
@@ -246,6 +280,8 @@ start_worker() {
     args+=("${SPEC_ARGS[@]}")
   fi
   if (( USE_L2 == 1 )); then
+    # Both workers share a namespace but have different instance IDs. The
+    # per-point path and namespace prevent history leaking into later variants.
     args+=(
       --speculative-ngram-l2-history-path "$l2_path"
       --speculative-ngram-l2-backend "$L2_BACKEND"
@@ -404,6 +440,8 @@ run_one() {
     fi
   fi
 
+  # Keep every service artifact and, when enabled, its shared history under
+  # this point's directory so cleanup cannot affect another comparison point.
   mkdir -p "$run_dir" "$l2_path"
   parse_variant "$variant"
   if (( ${#SPEC_ARGS[@]} > 0 )); then

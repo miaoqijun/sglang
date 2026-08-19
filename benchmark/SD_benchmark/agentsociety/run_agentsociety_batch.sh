@@ -5,9 +5,42 @@ set -euo pipefail
 # runner are self-contained; only an installed SGLang server environment and a
 # model path are external requirements.
 
+usage() {
+  cat <<'EOF'
+Usage:
+  MODEL_PATH=/path/to/model VARIANTS="baseline ngram_d8 ngram_prob_d8" \
+  CONCURRENCIES="1 4 16" \
+  bash SD_benchmark/agentsociety/run_agentsociety_batch.sh
+
+Starts a fresh SGLang server for each AgentSociety replay point, then replays
+the bundled record while preserving its recorded LLM-call dependencies.
+
+Key environment variables:
+  RECORD_PATH        AgentSociety raw record JSONL. A portable default is bundled.
+  VARIANTS           baseline, ngram_d<N>, or ngram_prob_d<N>.
+  CONCURRENCIES      Replay concurrency values. Default: "1 4 16 32".
+  MODEL_PATH         Target model path. SERVED_MODEL_NAME overrides its API name.
+  REPLAY_MODE        faithful (default) or aggressive scheduling.
+  CALL_TYPES         Optional comma-separated record template filter.
+  TEMPERATURE        Default 0 for comparable SD runs; set USE_RECORDED_TEMPERATURE=1
+                     to preserve record-level temperatures.
+  BATCH_ROOT         Parent output directory. Default: SD_benchmark/outputs/agentsociety.
+
+Each point writes replay_trace.jsonl, summary.json, server.log, gpu.csv, and
+the batch root contains batch_results.csv.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python}"
-SGLANG_ENV="${SGLANG_ENV:-sglang-v059}"
+SGLANG_ENV="${SGLANG_ENV:-sglang-v0514}"
 RUNNER_ENV="${RUNNER_ENV:-${SGLANG_ENV}}"
 SGLANG_DIR="${SGLANG_DIR:-/mnt/d/code/sglang}"
 MODEL_PATH="${MODEL_PATH:-/mnt/d/code/Qwen2.5-14B-Instruct-AWQ}"

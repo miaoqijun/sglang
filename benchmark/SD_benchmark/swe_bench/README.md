@@ -107,13 +107,50 @@ CONCURRENCIES="1 4 16" \
 VARIANTS="baseline ngram_d4 ngram_d8" \
 MAX_TOTAL_TOKENS=32768 MAX_TOKENS=1024 \
 TEMPERATURE=0 TOP_P=1.0 SEED=0 \
-SGLANG_ENV=sglang-v059 BENCH_ENV=as \
-SGLANG_DIR=/mnt/d/code/sglang AS_DIR=/mnt/d/code/AgentSociety \
+SGLANG_ENV=sglang-v0514 \
+SGLANG_DIR=/mnt/d/code/sglang \
 bash SD_benchmark/run_benchmark_batch.sh
 ```
 
 `LIMIT` is the number of workflows, not the number of raw LLM calls.
 `MAX_STEPS_PER_WORKFLOW` caps assistant turns within every selected workflow.
+
+## Teacher-Forcing Reference
+
+Build a full target-output reference from the bundled mini-swe-agent trace:
+
+```bash
+python SD_benchmark/swe_bench/build_teacher_forcing_trace.py \
+  --trace-jsonl SD_benchmark/swe_bench/mini_swe_qwen25_coder_32b_50workflows.jsonl \
+  --output SD_benchmark/swe_bench/mini_swe_teacher_forcing.jsonl
+```
+
+The reference contains the source `output` plus `workflow_id`, `step_id`, and
+`call_id`. With no selection arguments, it contains all 50 bundled workflows
+and all 1091 LLM calls. `--limit`, `--max-steps-per-workflow`, and
+`--skip-failure-list` are available only when an intentionally matched subset
+is needed. Pass this file to `run_swe_trace.py` with
+`--teacher-forcing-trace` and the serving model's `--tokenizer`.
+
+For a direct single-instance NGRAM server on `:19191`:
+
+```bash
+python SD_benchmark/swe_bench/run_swe_trace.py \
+  --trace-jsonl SD_benchmark/swe_bench/mini_swe_qwen25_coder_32b_50workflows.jsonl \
+  --server-url http://127.0.0.1:19191/v1 \
+  --model Qwen2.5-14B-Instruct \
+  --temperature 0 --top-p 1 --seed 0 \
+  --max-tokens 1024 --concurrency 1 \
+  --tool-mode none \
+  --teacher-forcing-trace SD_benchmark/swe_bench/mini_swe_teacher_forcing.jsonl \
+  --tokenizer /path/to/Qwen2.5-14B-Instruct \
+  --collect-sglang-spec-metrics \
+  --output-dir SD_benchmark/outputs/swe_bench/teacher_forcing_single_instance
+```
+
+Teacher forcing currently requires a direct worker URL. The multi-instance
+gateway must additionally preserve `custom_params` before it can forward the
+teacher token ids.
 
 ## Fixed Valid-Request Subset
 

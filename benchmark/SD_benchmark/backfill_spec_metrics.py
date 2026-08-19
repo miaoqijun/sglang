@@ -188,9 +188,17 @@ def backfill_csv(input_path: Path, output_path: Path) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Backfill SGLang speculative metrics into SD_benchmark batch_results.csv."
+        description="Backfill raw SGLang speculative metrics into an existing SD_benchmark batch_results.csv.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python SD_benchmark/backfill_spec_metrics.py "
+            "SD_benchmark/outputs/<run>/batch_results.csv\n\n"
+            "Reads saved server_info.json files and writes <input>.with_spec_metrics.csv "
+            "unless --output or --in-place is selected."
+        ),
     )
-    parser.add_argument("batch_results", type=Path)
+    parser.add_argument("batch_results", type=Path, help="Existing batch_results.csv to enrich.")
     parser.add_argument(
         "--output",
         type=Path,

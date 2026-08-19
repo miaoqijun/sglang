@@ -81,8 +81,7 @@ combination, runs the portable replay, then stops it. No NGRAM history leaks
 between points.
 
 ```bash
-SGLANG_ENV=sglang-v059 \
-RUNNER_ENV=as \
+SGLANG_ENV=sglang-v0514 \
 SGLANG_DIR=/mnt/d/code/sglang \
 MODEL_PATH=/mnt/d/code/Qwen2.5-7B-Instruct-AWQ \
 SERVED_MODEL_NAME=Qwen2.5-7B-Instruct-AWQ \

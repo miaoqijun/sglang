@@ -73,7 +73,19 @@ def group_workflows(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert a mini-swe-agent trace into teacher-forcing targets."
+        description=(
+            "Convert a mini-swe-agent replay trace into fixed target outputs "
+            "for SGLang teacher-forced NGRAM replay."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python SD_benchmark/swe_bench/build_teacher_forcing_trace.py "
+            "--trace-jsonl SD_benchmark/swe_bench/mini_swe_qwen25_coder_32b_50workflows.jsonl "
+            "--output SD_benchmark/swe_bench/mini_swe_teacher_forcing.jsonl\n\n"
+            "Use the same --limit, --max-steps-per-workflow, and --skip-failure-list "
+            "selection in this builder and run_swe_trace.py when replaying a subset."
+        ),
     )
     parser.add_argument("--trace-jsonl", type=Path, default=DEFAULT_TRACE)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)

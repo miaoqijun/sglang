@@ -363,6 +363,8 @@ def run_item(
     conversation: list[dict[str, str]] = []
     for turn_id, user_text in enumerate(item.turns):
         conversation.append({"role": "user", "content": user_text})
+        # Keep a request-local snapshot: later turns must include this run's
+        # generated assistant output, while the benchmark item stays reusable.
         request_messages = [dict(message) for message in conversation]
         teacher_turn = teacher_forcing_turns.get((item.question_id, turn_id))
         request_extra_body = copy.deepcopy(extra_body)
@@ -381,6 +383,8 @@ def run_item(
                 f"{item.benchmark}:{item.question_id}:turn{turn_id}"
             )
 
+        # Round-robin only chooses the HTTP destination. Conversation state is
+        # kept locally, so a multi-turn request remains semantically intact.
         request_server_url = server_urls[(item_index + turn_id) % len(server_urls)]
         response, latency_s, error = call_chat_completion(
             server_url=request_server_url,
@@ -535,7 +539,16 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Run exactly one local benchmark against an OpenAI-compatible chat "
             "server and save per-turn JSONL traces."
-        )
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python SD_benchmark/run_benchmark.py --benchmark mt_bench "
+            "--model Qwen2.5-14B-Instruct --concurrency 4 "
+            "--collect-sglang-spec-metrics "
+            "--output-dir SD_benchmark/outputs/mt_bench_smoke\n\n"
+            "Outputs: turn_traces.jsonl and summary.json in --output-dir."
+        ),
     )
     parser.add_argument(
         "--benchmark",
@@ -553,6 +566,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--server-url",
         "--server_url",
         default="http://127.0.0.1:1919/v1",
+        help="OpenAI-compatible chat-completions base URL.",
     )
     parser.add_argument(
         "--server-urls",
@@ -560,25 +574,28 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional worker URLs used with client-side round-robin routing.",
     )
-    parser.add_argument("--model", "--model-name", "--model_name", required=True)
-    parser.add_argument("--api-key", default="dummy")
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", "--top_p", type=float, default=1.0)
+    parser.add_argument(
+        "--model", "--model-name", "--model_name", required=True,
+        help="Served model name accepted by the server.",
+    )
+    parser.add_argument("--api-key", default="dummy", help="Bearer token for the server.")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
+    parser.add_argument("--top-p", "--top_p", type=float, default=1.0, help="Top-p sampling value.")
     parser.add_argument(
         "--seed",
         type=int,
         default=0,
         help="Optional request seed. Use --seed -1 to omit the seed field.",
     )
-    parser.add_argument("--max-tokens", "--max_tokens", type=int, default=1024)
-    parser.add_argument("--concurrency", type=int, default=1)
-    parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--max-tokens", "--max_tokens", type=int, default=1024, help="Maximum completion tokens per turn.")
+    parser.add_argument("--concurrency", type=int, default=1, help="Maximum independent questions in flight.")
+    parser.add_argument("--timeout", type=float, default=600.0, help="Per-request timeout in seconds.")
     parser.add_argument(
         "--categories",
         default="",
         help="Optional comma-separated category filter.",
     )
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=None, help="Optional maximum number of benchmark questions.")
     parser.add_argument(
         "--humaneval-style",
         choices=["completion_instruction", "raw_user"],
@@ -614,7 +631,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Local tokenizer path used to encode --teacher-forcing-trace.",
     )
-    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None, help="Directory for turn_traces.jsonl and summary.json.")
     parser.add_argument(
         "--print-every",
         type=int,

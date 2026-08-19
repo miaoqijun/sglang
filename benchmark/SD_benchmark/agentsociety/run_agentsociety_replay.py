@@ -102,6 +102,8 @@ def as_int(value: Any, default: int = 0) -> int:
 def build_steps(
     rows: list[tuple[int, dict[str, Any]]], selected_types: set[str]
 ) -> list[Step]:
+    # Preserve the record's step -> phase -> agent queue topology before any
+    # HTTP work starts; flattening the JSONL would destroy agent-local order.
     grouped: dict[int, Step] = {}
     for line_no, record in rows:
         if selected_types and call_type(record) not in selected_types:
@@ -344,6 +346,8 @@ async def main_async(args: argparse.Namespace) -> int:
 
     for step in steps:
         pre = getattr(step, "pre_dispatch")
+        # Aggressive mode relaxes only pre-dispatch agent chains. Main and
+        # post-intercept retain their record-level sequencing in both modes.
         if args.mode == "aggressive":
             await asyncio.gather(*(fire(record) for records in pre.values() for record in records))
         else:
@@ -381,20 +385,35 @@ async def main_async(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Replay a portable AgentSociety record.")
-    parser.add_argument("--record", type=Path, default=DEFAULT_RECORD)
-    parser.add_argument("--server-url", default="http://127.0.0.1:1919/v1")
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--api-key", default="dummy")
-    parser.add_argument("--mode", choices=("faithful", "aggressive"), default="faithful")
-    parser.add_argument("--max-concurrency", type=int, default=1)
-    parser.add_argument("--temperature", type=float, default=None, help="Override recorded temperature.")
-    parser.add_argument("--max-tokens", type=int, default=None, help="Override recorded max_tokens.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Replay a portable AgentSociety LLM-call record without starting an "
+            "AgentSociety simulation. Faithful mode preserves recorded call "
+            "dependencies; later prompts come from the record."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python SD_benchmark/agentsociety/run_agentsociety_replay.py "
+            "--server-url http://127.0.0.1:1919/v1 --model Qwen2.5-14B-Instruct "
+            "--mode faithful --max-concurrency 16 "
+            "--output-dir SD_benchmark/outputs/agentsociety/smoke_c16\n\n"
+            "Outputs: replay_trace.jsonl and summary.json in --output-dir."
+        ),
+    )
+    parser.add_argument("--record", type=Path, default=DEFAULT_RECORD, help="AgentSociety raw record JSONL.")
+    parser.add_argument("--server-url", default="http://127.0.0.1:1919/v1", help="OpenAI-compatible chat-completions base URL.")
+    parser.add_argument("--model", required=True, help="Served model name.")
+    parser.add_argument("--api-key", default="dummy", help="Bearer token for the server.")
+    parser.add_argument("--mode", choices=("faithful", "aggressive"), default="faithful", help="faithful preserves phase scheduling; aggressive submits ready calls immediately.")
+    parser.add_argument("--max-concurrency", type=int, default=1, help="Maximum replay requests in flight.")
+    parser.add_argument("--temperature", type=float, default=None, help="Override recorded temperature for every request.")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Override recorded max_tokens for every request.")
     parser.add_argument("--call-types", default="", help="Optional comma-separated call-type filter.")
-    parser.add_argument("--collect-sglang-spec-metrics", action="store_true")
-    parser.add_argument("--timeout", type=float, default=600.0)
-    parser.add_argument("--print-every", type=int, default=100)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--collect-sglang-spec-metrics", action="store_true", help="Request raw per-request SGLang speculative counters.")
+    parser.add_argument("--timeout", type=float, default=600.0, help="Per-request timeout in seconds.")
+    parser.add_argument("--print-every", type=int, default=100, help="Print progress every N completed calls.")
+    parser.add_argument("--output-dir", type=Path, required=True, help="Directory for replay_trace.jsonl and summary.json.")
     return parser
 
 

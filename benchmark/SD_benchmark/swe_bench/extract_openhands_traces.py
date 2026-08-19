@@ -87,6 +87,8 @@ def load_trajectory(path: Path) -> tuple[list[dict[str, Any]], dict[str, str | N
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON in {path}: {exc}") from exc
 
+    # Public agent submissions use several top-level layouts. Normalize only
+    # the message list here so the replay format stays independent of one agent.
     if isinstance(data, list):
         messages = data
     elif isinstance(data, dict):
@@ -146,6 +148,9 @@ def iter_llm_calls(
     for message_index, raw_message in enumerate(raw_messages):
         message = normalized_message(raw_message, message_index)
         if message["role"] == "assistant":
+            # The prompt for an assistant turn is every earlier source message.
+            # Appending this assistant message below makes its recorded output
+            # available to the next turn without executing any tool action.
             output_text = message.get("text", "")
             calls = message.get("tool_calls") or []
             if output_text or calls or include_empty_assistant:
@@ -185,7 +190,16 @@ def main() -> int:
         description=(
             "Extract assistant-turn LLM calls from SWE-bench agent trajectory "
             "JSON files."
-        )
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python SD_benchmark/swe_bench/extract_openhands_traces.py /path/to/trajs "
+            "--only-submitted --limit 50 "
+            "--output SD_benchmark/outputs/swe_bench/mini_swe.jsonl\n\n"
+            "The output is a replayable JSONL trace. It stores recorded prompt "
+            "messages and source assistant outputs; it does not run an agent."
+        ),
     )
     parser.add_argument(
         "trajectory_dir",

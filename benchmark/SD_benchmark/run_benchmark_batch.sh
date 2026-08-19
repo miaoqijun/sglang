@@ -14,10 +14,50 @@ set -euo pipefail
 #   ${BATCH_DIR}/<variant>_c<concurrency>/server.log
 #   ${BATCH_DIR}/<variant>_c<concurrency>/gpu.csv
 
-SGLANG_ENV="${SGLANG_ENV:-sglang-v059}"
-BENCH_ENV="${BENCH_ENV:-as}"
+usage() {
+  cat <<'EOF'
+Usage:
+  BENCHMARKS="mt_bench spec_bench HumanEval" VARIANTS="baseline ngram_d8" \
+  CONCURRENCIES="1 4 16" bash SD_benchmark/run_benchmark_batch.sh
 
-AS_DIR="${AS_DIR:-/mnt/d/code/AgentSociety}"
+Runs one SGLang server per benchmark/variant/concurrency point. Each point is
+fresh, so server-side NGRAM history does not carry across comparisons.
+
+Key environment variables:
+  BENCHMARKS       Space- or comma-separated: HumanEval, mt_bench, spec_bench,
+                   swe_bench. Default: mt_bench.
+  VARIANTS         baseline, ngram_d<N>, ngram_prob_d<N>, or ngram_backmatch_d<N>.
+  CONCURRENCIES    Client concurrency values. Default: "1 4 16 32 64 100".
+  MODEL_PATH       Target model path.
+  SGLANG_DIR       SGLang checkout. SGLANG_ENV selects the conda environment.
+  BENCH_ENV        Optional separate client environment; defaults to SGLANG_ENV.
+  AS_DIR           Optional project-root override; derived from this script by default.
+  MAX_TOKENS       Per-request completion limit. Default: 1024.
+  MAX_TOTAL_TOKENS Server context/KV-cache budget when supported by SGLang.
+  BATCH_ROOT       Parent output directory. Default: SD_benchmark/outputs/benchmark_sglang_batch.
+
+For swe_bench, also set SWE_TRACE_JSONL, LIMIT (workflows), and optionally
+MAX_STEPS_PER_WORKFLOW. Results include turn_traces.jsonl, summary.json,
+server.log, gpu.csv, and batch_results.csv.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SGLANG_ENV="${SGLANG_ENV:-sglang-v0514}"
+# The request runner only needs the client dependencies already installed with
+# SGLang. Override this only when a separate runner environment is necessary.
+BENCH_ENV="${BENCH_ENV:-${SGLANG_ENV}}"
+
+# Keep AS_DIR as an override for copied layouts, but derive the repository root
+# from this script by default so callers do not need to set it.
+AS_DIR="${AS_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 SGLANG_DIR="${SGLANG_DIR:-/mnt/d/code/sglang}"
 MODEL_PATH="${MODEL_PATH:-/mnt/d/code/Qwen2.5-7B-Instruct-AWQ}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen2.5-7B-Instruct-AWQ}"
@@ -74,7 +114,6 @@ NGRAM_CAPACITY="${NGRAM_CAPACITY:-500000}"
 NGRAM_BACKMATCH_CONTEXT_TOKENS="${NGRAM_BACKMATCH_CONTEXT_TOKENS:-32}"
 NGRAM_BACKMATCH_MAX_CANDIDATES="${NGRAM_BACKMATCH_MAX_CANDIDATES:-16}"
 NGRAM_HYBRID_SCAN_OCCURRENCES="${NGRAM_HYBRID_SCAN_OCCURRENCES:-0}"
-NGRAM_PROB_BACKMATCH_MAX_CONTEXTS_PER_NODE="${NGRAM_PROB_BACKMATCH_MAX_CONTEXTS_PER_NODE:-64}"
 NGRAM_SCOPE_BY_EXTRA_KEY="${NGRAM_SCOPE_BY_EXTRA_KEY:-0}"
 NGRAM_DRAFT_TOKENS="${NGRAM_DRAFT_TOKENS:-8}"
 
@@ -86,7 +125,6 @@ read -r -a CONCURRENCIES_ARR <<< "${CONCURRENCIES_STR}"
 #   ngram_d<N> / ngram_bfs_d<N>
 #   ngram_prob_d<N> / prob_d<N>
 #   ngram_backmatch_d<N> / backmatch_d<N>
-#   ngram_prob_backmatch_d<N> / prob_backmatch_d<N> / prob_backmatch
 # For variants without an explicit d<N>, NGRAM_DRAFT_TOKENS is used.
 VARIANTS_STR="${VARIANTS:-baseline ngram_d8}"
 read -r -a VARIANTS_ARR <<< "${VARIANTS_STR}"
@@ -307,13 +345,6 @@ variant_spec_args() {
       draft="${variant##*_d}"
       match_type="BACKMATCH"
       ;;
-    ngram_prob_backmatch|prob_backmatch)
-      match_type="PROB_BACKMATCH"
-      ;;
-    ngram_prob_backmatch_d*|prob_backmatch_d*)
-      draft="${variant##*_d}"
-      match_type="PROB_BACKMATCH"
-      ;;
     *)
       echo "ERROR: unsupported VARIANT=${variant}" >&2
       exit 2
@@ -335,8 +366,7 @@ variant_spec_args() {
     "--speculative-ngram-capacity ${NGRAM_CAPACITY}" \
     "--speculative-ngram-backmatch-context-tokens ${NGRAM_BACKMATCH_CONTEXT_TOKENS}" \
     "--speculative-ngram-backmatch-max-candidates ${NGRAM_BACKMATCH_MAX_CANDIDATES}" \
-    "--speculative-ngram-hybrid-scan-occurrences ${NGRAM_HYBRID_SCAN_OCCURRENCES}" \
-    "--speculative-ngram-prob-backmatch-max-contexts-per-node ${NGRAM_PROB_BACKMATCH_MAX_CONTEXTS_PER_NODE}"
+    "--speculative-ngram-hybrid-scan-occurrences ${NGRAM_HYBRID_SCAN_OCCURRENCES}"
 }
 
 start_server() {
@@ -531,9 +561,7 @@ def parse_variant(value, default_draft):
     if value == "baseline":
         return "", "", ""
     match_type = "BFS"
-    if "prob_backmatch" in value:
-        match_type = "PROB_BACKMATCH"
-    elif "backmatch" in value:
+    if "backmatch" in value:
         match_type = "BACKMATCH"
     elif "prob" in value:
         match_type = "PROB"

@@ -21,6 +21,40 @@ set -euo pipefail
 # type: baseline, ngram_d<N>/ngram_bfs_d<N>, ngram_prob_d<N>.  Append _no_l2
 # to disable shared L2 only, e.g. ngram_d8_no_l2.
 
+usage() {
+  cat <<'EOF'
+Usage:
+  OFFICIAL_RUNNER_DIR=/path/to/specdec_bench MODEL_PATH=/path/to/model \
+  SPEED_CONFIGS="throughput_1k" VARIANTS="baseline ngram_d8" \
+  CONCURRENCIES="1 4" GPU_IDS="0 1" \
+  bash SD_benchmark/speed_bench/run_speed_bench_batch.sh
+
+Runs NVIDIA's official SPEED-Bench runner through two SGLang workers and a
+round-robin gateway. Install the remote adapter first with
+install_official_runner_adapter.py.
+
+Key environment variables:
+  OFFICIAL_RUNNER_DIR  Official NVIDIA examples/specdec_bench checkout.
+  SPEED_CONFIGS        Prepared dataset configurations, e.g. throughput_1k.
+  VARIANTS             baseline, ngram_d<N>, ngram_prob_d<N>; append _no_l2.
+  CONCURRENCIES        Official runner --concurrency values.
+  NUM_REQUESTS         Number of official requests selected per point.
+  OUTPUT_LENGTH        Official runner generation length. Default: 1024.
+  GPU_IDS              Exactly two worker GPU IDs, e.g. "0 1".
+  RUNNER_PYTHON_BIN    Optional Python executable for the official runner.
+  BATCH_ROOT           Parent output directory.
+
+Each point gets fresh workers, router, L2 namespace, and official-runner output.
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    usage
+    exit 0
+    ;;
+esac
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AS_DIR="${AS_DIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"

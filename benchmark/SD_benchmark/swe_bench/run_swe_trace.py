@@ -65,6 +65,8 @@ def group_workflows(
         grouped.setdefault(workflow_id, []).append(row)
 
     workflows: list[list[dict[str, Any]]] = []
+    # Stable workflow and step ordering makes LIMIT reproducible and defines
+    # the serial dependency order later enforced by run_workflow().
     for workflow_id in sorted(grouped, key=lambda value: int(value) if value.isdigit() else value):
         workflow_rows = sorted(
             grouped[workflow_id],
@@ -561,6 +563,8 @@ def run_workflow(
     teacher_forcing_turns: dict[tuple[str, str, str], TeacherForcingTurn],
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    # Workflow parallelism is created by the caller. Keep its steps serial so
+    # a later source prompt is never submitted before its predecessor returns.
     for row in workflow_rows:
         records.append(
             run_row(
@@ -725,18 +729,32 @@ def load_tool_schema(path: Path) -> list[dict[str, Any]]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Replay converted SWE-bench/OpenHands LLM-call traces."
+        description=(
+            "Replay converted SWE-bench/OpenHands LLM-call traces as a causal "
+            "serving workload. Steps within one workflow are serial; separate "
+            "workflows may run concurrently."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python SD_benchmark/swe_bench/run_swe_trace.py "
+            "--trace-jsonl SD_benchmark/swe_bench/mini_swe_qwen25_coder_32b_50workflows.jsonl "
+            "--server-url http://127.0.0.1:1919/v1 --model Qwen2.5-14B-Instruct "
+            "--tool-mode none --limit 20 --max-steps-per-workflow 20 "
+            "--output-dir SD_benchmark/outputs/swe_bench/smoke\n\n"
+            "Generated commands are recorded but not executed."
+        ),
     )
-    parser.add_argument("--trace-jsonl", type=Path, default=DEFAULT_TRACE)
-    parser.add_argument("--server-url", default="http://127.0.0.1:1919/v1")
-    parser.add_argument("--model", "--model-name", "--model_name", required=True)
-    parser.add_argument("--api-key", default="dummy")
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--top-p", "--top_p", type=float, default=1.0)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-tokens", "--max_tokens", type=int, default=1024)
-    parser.add_argument("--concurrency", type=int, default=1)
-    parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument("--trace-jsonl", type=Path, default=DEFAULT_TRACE, help="Converted workflow JSONL to replay.")
+    parser.add_argument("--server-url", default="http://127.0.0.1:1919/v1", help="OpenAI-compatible chat-completions base URL.")
+    parser.add_argument("--model", "--model-name", "--model_name", required=True, help="Served model name.")
+    parser.add_argument("--api-key", default="dummy", help="Bearer token for the server.")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature.")
+    parser.add_argument("--top-p", "--top_p", type=float, default=1.0, help="Top-p sampling value.")
+    parser.add_argument("--seed", type=int, default=0, help="Sampling seed.")
+    parser.add_argument("--max-tokens", "--max_tokens", type=int, default=1024, help="Maximum completion tokens per turn.")
+    parser.add_argument("--concurrency", type=int, default=1, help="Maximum workflows in flight; steps remain serial within each workflow.")
+    parser.add_argument("--timeout", type=float, default=600.0, help="Per-request timeout in seconds.")
     parser.add_argument(
         "--limit",
         type=int,
@@ -777,7 +795,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_TOOL_PROMPT,
         help="Plain-text tool instructions used only when --tool-mode=plain.",
     )
-    parser.add_argument("--extra-body", type=parse_extra_body, default={})
+    parser.add_argument("--extra-body", type=parse_extra_body, default={}, help="JSON object merged into every chat-completion request.")
     parser.add_argument(
         "--collect-sglang-spec-metrics",
         action="store_true",
@@ -797,8 +815,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Local serving-model tokenizer path required for teacher forcing.",
     )
-    parser.add_argument("--output-dir", type=Path, default=None)
-    parser.add_argument("--print-every", type=int, default=20)
+    parser.add_argument("--output-dir", type=Path, default=None, help="Directory for replay_trace.jsonl and summary.json.")
+    parser.add_argument("--print-every", type=int, default=20, help="Print progress every N completed requests.")
     parser.add_argument(
         "--server-info-output",
         type=Path,
@@ -937,6 +955,8 @@ def main() -> int:
     completed = 0
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        # Submit one serial chain per workflow. The executor limits concurrent
+        # workflows, rather than allowing independent calls within a workflow.
         future_to_workflow = {
             pool.submit(
                 run_workflow,

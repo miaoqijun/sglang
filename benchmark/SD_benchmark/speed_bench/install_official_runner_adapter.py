@@ -29,9 +29,21 @@ def replace_once(path: Path, old: str, new: str) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("official_root", type=Path, help="Official examples/specdec_bench checkout")
-    parser.add_argument("--check", action="store_true", help="Report required changes without writing files")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Install the explicit SGLANG_REMOTE adapter into an external NVIDIA "
+            "Model Optimizer SpecDec-Bench checkout."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example:\n"
+            "  python SD_benchmark/speed_bench/install_official_runner_adapter.py "
+            "/path/to/model-optimizer-specbench/examples/specdec_bench --check\n\n"
+            "Run again without --check to modify only the supplied external checkout."
+        ),
+    )
+    parser.add_argument("official_root", type=Path, help="Official examples/specdec_bench checkout.")
+    parser.add_argument("--check", action="store_true", help="Report required changes without writing files.")
     args = parser.parse_args()
 
     root = args.official_root.expanduser().resolve()
@@ -44,6 +56,8 @@ def main() -> int:
             "Expected official layout: <root>/run.py and <root>/specdec_bench/models/__init__.py"
         )
 
+    # Each replacement is guarded by its desired text, making the installer
+    # idempotent and safe to rerun after updating this adapter.
     changes: list[str] = []
     adapter_target = models / "sglang_remote.py"
     if not adapter_target.exists() or adapter_target.read_bytes() != ADAPTER_SOURCE.read_bytes():
